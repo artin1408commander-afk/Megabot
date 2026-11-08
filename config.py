@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "2138298271:0aSgr4kiWGnt0u9IvnVW584M3HxJHZkN_-4")
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:FVHwCKGqMnVKkkjRZPhVQjFtVsGakaaN@postgres.railway.internal:5432/railway")
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:YpMVBylxCcaSfYUSScLLUlLRXosQYiuq@postgres.railway.internal:5432/railway")
 OWNER_ID = int(os.getenv("OWNER_ID", "1967315238"))
 BOT_VERSION = os.getenv("BOT_VERSION", "v 1.3.2-ban-notice-once")
 POLL_TIMEOUT = int(os.getenv("POLL_TIMEOUT", "25"))

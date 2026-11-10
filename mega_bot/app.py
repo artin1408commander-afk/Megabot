@@ -12,6 +12,7 @@ from .keyboards import USER_KEYBOARD, inline, menu_page, main_admin_menu, user_a
 from . import prices as price_mod
 from . import fun_content
 from .profanity import contains_profanity, extract_urls, text_similarity, collapse_for_match
+from .anti_abuse import detect_links, detect_advertisement, message_has_link, message_is_ad
 from . import schedule_lock as schlock
 from . import levels as level_mod
 from . import tts as tts_mod
@@ -5646,15 +5647,39 @@ class MegaBot:
         entities = msg.get('entities') or msg.get('caption_entities') or []
 
         if not reason and sec.get('antilink'):
-            if self._message_has_link(body, entities):
-                reason = 'لینک'
+            # Advanced anti-link: entities, markdown, uid, domains, @id, latin letters
+            try:
+                link_hit = detect_links(body, entities, block_latin=True, block_at_username=True)
+                if link_hit.hit:
+                    reason = 'لینک'
+                    log.info(
+                        'antilink hit chat=%s uid=%s reasons=%s',
+                        chat_id, uid, ','.join(link_hit.reasons or []),
+                    )
+            except Exception:
+                log.exception('detect_links failed')
+                if self._message_has_link(body, entities):
+                    reason = 'لینک'
         if not reason and sec.get('antimention'):
             mention_limit = int(mod.get('mention_limit') or 5)
             if self._count_mentions(body, entities) >= mention_limit:
                 reason = 'منشن انبوه'
         if not reason and sec.get('antiad'):
-            if re.search(r'(تبلیغ|کانال ما|عضویت اجباری|فالو کن|follow|subscribe)', body, re.I):
-                reason = 'تبلیغ'
+            try:
+                ad_hit = detect_advertisement(body, entities)
+                if ad_hit.hit:
+                    reason = 'تبلیغ'
+                    log.info(
+                        'antiad hit chat=%s uid=%s score=%s reasons=%s',
+                        chat_id, uid, ad_hit.score, ','.join((ad_hit.reasons or [])[:8]),
+                    )
+            except Exception:
+                log.exception('detect_advertisement failed')
+                if re.search(
+                    r'(تبلیغ|کانال ما|عضویت اجباری|فالو کن|follow|subscribe|خرید\s*سکه|فروش\s*سکه|ممبرگیری)',
+                    body, re.I,
+                ):
+                    reason = 'تبلیغ'
         if not reason and sec.get('antiprofane'):
             extra = await self.db.get_profanity_words(chat_id)
             if contains_profanity(body, extra):
@@ -5753,16 +5778,18 @@ class MegaBot:
     @staticmethod
     @staticmethod
     def _message_has_link(body: str, entities: list | None) -> bool:
-        """Strict link detection: entities + extract_urls (domains, invites, www)."""
-        if entities:
-            for e in entities:
-                t = (e.get('type') or '').lower()
-                if t in ('url', 'text_link'):
-                    return True
-        if not body:
-            return False
-        urls = extract_urls(body)
-        return bool(urls)
+        """Strict link detection via anti_abuse engine (entities, md, uid, domains, @, latin)."""
+        try:
+            return message_has_link(body or '', entities, strict_latin=True)
+        except Exception:
+            if entities:
+                for e in entities:
+                    et = (e.get('type') or '').lower()
+                    if et in ('url', 'text_link') or e.get('url'):
+                        return True
+            if not body:
+                return False
+            return bool(extract_urls(body))
 
 
     @staticmethod

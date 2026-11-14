@@ -199,6 +199,48 @@ class BaleAPI:
             self._redact(f'getUpdates network error: {type(last_error).__name__}: {last_error!r}')
         )
 
+
+    @staticmethod
+    def _normalize_reply_markup(reply_markup: dict | None) -> dict | str | None:
+        """Ensure inline buttons carry official Bale/Telegram style values.
+
+        Bale docs (docs.bale.ai): style ∈ {primary, success, danger}.
+        Some gateways expect reply_markup as a JSON *string*; we keep object for
+        application/json POST which aiohttp uses, after sanitizing each button.
+        """
+        if not reply_markup or not isinstance(reply_markup, dict):
+            return reply_markup
+        rows = reply_markup.get('inline_keyboard')
+        if not isinstance(rows, list):
+            return reply_markup
+        new_rows = []
+        for row in rows:
+            if not isinstance(row, list):
+                continue
+            new_row = []
+            for btn in row:
+                if not isinstance(btn, dict) or 'text' not in btn:
+                    continue
+                clean: dict = {'text': str(btn['text'])}
+                if btn.get('callback_data') is not None:
+                    clean['callback_data'] = str(btn['callback_data'])[:64]
+                if btn.get('url'):
+                    clean['url'] = str(btn['url'])
+                if btn.get('web_app'):
+                    clean['web_app'] = btn['web_app']
+                if btn.get('copy_text'):
+                    clean['copy_text'] = btn['copy_text']
+                # Official Bale button colors
+                st = btn.get('style')
+                if st in ('primary', 'success', 'danger'):
+                    clean['style'] = st
+                if isinstance(btn.get('disabled'), dict):
+                    clean['disabled'] = {}
+                new_row.append(clean)
+            if new_row:
+                new_rows.append(new_row)
+        return {'inline_keyboard': new_rows}
+
     async def send_message(
         self,
         chat_id: int,
@@ -211,7 +253,7 @@ class BaleAPI:
     ) -> dict:
         payload: dict[str, Any] = {'chat_id': chat_id, 'text': text}
         if reply_markup is not None:
-            payload['reply_markup'] = reply_markup
+            payload['reply_markup'] = self._normalize_reply_markup(reply_markup)
         if reply_to_message_id is not None:
             payload['reply_to_message_id'] = reply_to_message_id
         if parse_mode:
@@ -223,7 +265,7 @@ class BaleAPI:
     async def edit_message(self, chat_id: int, message_id: int, text: str, reply_markup: dict | None = None, parse_mode: str | None = 'Markdown') -> dict:
         payload: dict[str, Any] = {'chat_id': chat_id, 'message_id': message_id, 'text': text}
         if reply_markup is not None:
-            payload['reply_markup'] = reply_markup
+            payload['reply_markup'] = self._normalize_reply_markup(reply_markup)
         if parse_mode:
             payload['parse_mode'] = parse_mode
         return await self.call('editMessageText', payload)

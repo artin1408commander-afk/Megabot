@@ -843,7 +843,14 @@ class MegaBot:
                 await self.api.send_animation_bytes(chat_id, result, 'mega-bot.gif', 'ساخته‌شده با MEGA BOT')
             except Exception as exc:
                 log.exception('GIF conversion failed')
-                await self.safe_send(chat_id, f'ساخت GIF ناموفق بود: {self._short(exc)}')
+                await self.safe_send(
+                    chat_id,
+                    'ساخت این گیف پشتیبانی نمی‌شود؛ لطفاً یک فایل دیگر را امتحان کنید.\n'
+                    'یا به ادمین اطلاع دهید تا این مشکل را برطرف کند.\n\n'
+                    '*ارتباط با مگا*\n'
+                    'پشتیبانی: @Darkknight_support',
+                    parse_mode='Markdown',
+                )
             return
 
         # Track recent message ids (for پاک)

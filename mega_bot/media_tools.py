@@ -206,85 +206,104 @@ def image_to_gif(raw: bytes, text: str = '') -> bytes:
 
 
 def video_to_gif(raw: bytes, suffix: str = '.mp4', text: str = '') -> bytes:
+    """Video → GIF. ffmpeg only for demux/scale; Persian text via Pillow (no drawtext)."""
     if not shutil.which('ffmpeg'):
         raise RuntimeError('ffmpeg روی سرور نصب نیست؛ از Dockerfile همین پروژه برای استقرار استفاده کن.')
-    # Longer sources get a slightly higher soft ceiling
     long_source = len(raw) > 3 * 1024 * 1024
     limit = MAX_OUTPUT_LONG if long_source else MAX_OUTPUT_BYTES
 
     with tempfile.TemporaryDirectory(prefix='megabot-gif-') as tmp:
-        src, dst = Path(tmp) / ('input' + suffix), Path(tmp) / 'output.gif'
+        tmp_path = Path(tmp)
+        src = tmp_path / ('input' + (suffix if suffix.startswith('.') else f'.{suffix}'))
         src.write_bytes(raw)
+        frames_dir = tmp_path / 'frames'
+        frames_dir.mkdir()
+
         side = GIF_MAX_SIDE
         fps = GIF_FPS
-        vf = f'fps={fps},scale={side}:-1:flags=lanczos:force_original_aspect_ratio=decrease'
-        if text:
-            safe = (
-                text.replace('\\', '\\\\')
-                .replace(':', '\\:')
-                .replace("'", "\\'")
-                .replace('%', '\\%')
-            )
-            font = next((p for p in _BOLD_FONT_CANDIDATES if os.path.exists(p)), '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf')
-            # Auto-ish size: shorter text larger; long text smaller (never leaves frame via x/y clamp)
-            tlen = max(1, len(text.strip()))
-            # h/9 for short, down toward h/16 for long
-            fs_div = 9 if tlen <= 12 else (11 if tlen <= 24 else (14 if tlen <= 40 else 16))
-            # drawtext: horizontal, centered, lower third, bold font + strong border
-            vf += (
-                f",drawtext=fontfile='{font}':text='{safe}'"
-                f":fontcolor=white:borderw=3:bordercolor=black"
-                f":fontsize=h/{fs_div}:x=(w-text_w)/2:y=h*0.72-text_h/2"
-            )
-        palette = Path(tmp) / 'palette.png'
-        cmd1 = [
-            'ffmpeg', '-nostdin', '-v', 'error', '-y', '-i', str(src),
-            '-t', str(MAX_VIDEO_SECONDS), '-vf', vf + ',palettegen=stats_mode=diff', str(palette),
-        ]
-        cmd2 = [
-            'ffmpeg', '-nostdin', '-v', 'error', '-y', '-i', str(src), '-i', str(palette),
-            '-t', str(MAX_VIDEO_SECONDS),
-            '-filter_complex', f'{vf}[x];[x][1:v]paletteuse=dither=bayer:bayer_scale=3',
-            '-loop', '0', str(dst),
-        ]
-        subprocess.run(cmd1, check=True, timeout=45, capture_output=True)
-        subprocess.run(cmd2, check=True, timeout=45, capture_output=True)
-        result = dst.read_bytes()
+        # Simple, widely-supported scale (avoid fragile force_original_aspect_ratio flags)
+        # scale=w:h with -2 keeps aspect and even dimensions for encoder safety
+        vf = f'fps={fps},scale={side}:-2'
 
-        # Re-encode smaller if still over target
-        if len(result) > limit:
-            side2, fps2 = 360, 6
-            vf2 = f'fps={fps2},scale={side2}:-1:flags=lanczos:force_original_aspect_ratio=decrease'
-            if text:
-                safe = (
-                    text.replace('\\', '\\\\')
-                    .replace(':', '\\:')
-                    .replace("'", "\\'")
-                    .replace('%', '\\%')
-                )
-                font = next((p for p in _BOLD_FONT_CANDIDATES if os.path.exists(p)), '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf')
-                tlen = max(1, len(text.strip()))
-                fs_div = 10 if tlen <= 12 else (13 if tlen <= 30 else 16)
-                vf2 += (
-                    f",drawtext=fontfile='{font}':text='{safe}'"
-                    f":fontcolor=white:borderw=3:bordercolor=black"
-                    f":fontsize=h/{fs_div}:x=(w-text_w)/2:y=h*0.72-text_h/2"
-                )
-            palette2 = Path(tmp) / 'palette2.png'
-            dst2 = Path(tmp) / 'output2.gif'
-            subprocess.run(
-                ['ffmpeg', '-nostdin', '-v', 'error', '-y', '-i', str(src),
-                 '-t', str(MAX_VIDEO_SECONDS), '-vf', vf2 + ',palettegen=stats_mode=diff', str(palette2)],
-                check=True, timeout=45, capture_output=True,
+        def _run_ffmpeg(vf_expr: str) -> None:
+            # Clear previous frames
+            for old in frames_dir.glob('f_*.png'):
+                old.unlink(missing_ok=True)
+            cmd = [
+                'ffmpeg', '-nostdin', '-hide_banner', '-loglevel', 'error', '-y',
+                '-i', str(src),
+                '-t', str(MAX_VIDEO_SECONDS),
+                '-vf', vf_expr,
+                '-frames:v', str(GIF_MAX_FRAMES),
+                str(frames_dir / 'f_%04d.png'),
+            ]
+            try:
+                subprocess.run(cmd, check=True, timeout=60, capture_output=True)
+            except subprocess.CalledProcessError as exc:
+                err = (exc.stderr or b'').decode('utf-8', 'ignore')[:400]
+                raise RuntimeError(f'ffmpeg failed: {err or exc}') from exc
+            except subprocess.TimeoutExpired as exc:
+                raise RuntimeError('ffmpeg timeout — ویدیو خیلی طولانی یا سنگین است.') from exc
+
+        try:
+            _run_ffmpeg(vf)
+        except RuntimeError:
+            # Fallback: lower res / fps
+            _run_ffmpeg(f'fps=6,scale=360:-2')
+
+        paths = sorted(frames_dir.glob('f_*.png'))
+        if not paths:
+            # Last resort: single-frame extract
+            still = tmp_path / 'still.png'
+            cmd = [
+                'ffmpeg', '-nostdin', '-hide_banner', '-loglevel', 'error', '-y',
+                '-i', str(src), '-frames:v', '1', '-q:v', '2', str(still),
+            ]
+            try:
+                subprocess.run(cmd, check=True, timeout=30, capture_output=True)
+            except Exception as exc:
+                raise RuntimeError(f'استخراج فریم ناموفق: {type(exc).__name__}') from exc
+            if not still.exists():
+                raise RuntimeError('هیچ فریمی از ویدیو استخراج نشد.')
+            paths = [still]
+
+        frames: list[Image.Image] = []
+        for fp in paths[:GIF_MAX_FRAMES]:
+            with Image.open(fp) as im:
+                fr = ImageOps.contain(im.convert('RGB'), (GIF_MAX_SIDE, GIF_MAX_SIDE))
+                if text:
+                    fr = _overlay(fr, text)
+                frames.append(fr.copy())
+
+        if not frames:
+            raise RuntimeError('ساخت فریم گیف ناموفق بود.')
+
+        frames_q = _quantize_gif_frames(frames)
+        out = io.BytesIO()
+        frames_q[0].save(
+            out,
+            format='GIF',
+            save_all=True,
+            append_images=frames_q[1:] if len(frames_q) > 1 else [],
+            loop=0,
+            duration=max(80, int(1000 / max(1, min(fps, 12)))),
+            optimize=True,
+        )
+        result = out.getvalue()
+
+        if len(result) > limit and len(frames) > 1:
+            # Shrink: fewer frames + smaller side
+            step = max(1, len(frames) // 24)
+            small = []
+            for fr in frames[::step][:24]:
+                fr2 = ImageOps.contain(fr, (360, 360))
+                small.append(fr2.convert('P', palette=Image.ADAPTIVE, colors=96))
+            out2 = io.BytesIO()
+            small[0].save(
+                out2, format='GIF', save_all=True, append_images=small[1:],
+                loop=0, duration=120, optimize=True,
             )
-            subprocess.run(
-                ['ffmpeg', '-nostdin', '-v', 'error', '-y', '-i', str(src), '-i', str(palette2),
-                 '-t', str(MAX_VIDEO_SECONDS),
-                 '-filter_complex', f'{vf2}[x];[x][1:v]paletteuse=dither=bayer:bayer_scale=5',
-                 '-loop', '0', str(dst2)],
-                check=True, timeout=45, capture_output=True,
-            )
-            result = dst2.read_bytes()
+            result = out2.getvalue()
 
         hard_cap = MAX_OUTPUT_LONG if long_source else MAX_OUTPUT_BYTES
         if len(result) > hard_cap:

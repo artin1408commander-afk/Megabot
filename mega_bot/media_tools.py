@@ -8,9 +8,9 @@ MAX_VIDEO_SECONDS = 20
 # Target: most GIFs well under 5MB; long clips may approach this ceiling.
 MAX_OUTPUT_BYTES = 5 * 1024 * 1024
 MAX_OUTPUT_LONG = 8 * 1024 * 1024  # only for longer source videos
-GIF_MAX_SIDE = 560
-GIF_FPS = 10
-GIF_MAX_FRAMES = 60
+GIF_MAX_SIDE = 480
+GIF_FPS = 8
+GIF_MAX_FRAMES = 48
 
 # Same family as stats dashboard (Vazirmatn Bold) — never reverse with bidi.
 _FONT_DIR = Path(__file__).resolve().parent / 'assets' / 'fonts'
@@ -206,99 +206,188 @@ def image_to_gif(raw: bytes, text: str = '') -> bytes:
 
 
 def video_to_gif(raw: bytes, suffix: str = '.mp4', text: str = '') -> bytes:
-    """Video → GIF. Map video stream only (avoid audio colorspace errors). Text via Pillow."""
+    """Classic palette GIF pipeline with a clean intermediate video.
+
+    Some Bale videos carry a second stream (0:1) that breaks filter graphs
+    with 'Invalid color space'. We always strip to a single yuv420p video
+    first, then run the same palettegen/paletteuse flow as before.
+    Text is applied with Pillow (no ffmpeg drawtext).
+    """
     if not shutil.which('ffmpeg'):
         raise RuntimeError('ffmpeg روی سرور نصب نیست؛ از Dockerfile همین پروژه برای استقرار استفاده کن.')
     long_source = len(raw) > 3 * 1024 * 1024
     limit = MAX_OUTPUT_LONG if long_source else MAX_OUTPUT_BYTES
 
+    def run(cmd: list[str], timeout: int = 60) -> None:
+        proc = subprocess.run(cmd, capture_output=True, timeout=timeout)
+        if proc.returncode != 0:
+            err = (proc.stderr or b'').decode('utf-8', 'ignore')
+            # keep last meaningful lines
+            tail = ' | '.join(ln.strip() for ln in err.strip().splitlines()[-4:] if ln.strip())
+            raise RuntimeError(tail or f'ffmpeg exit {proc.returncode}')
+
     with tempfile.TemporaryDirectory(prefix='megabot-gif-') as tmp:
         tmp_path = Path(tmp)
-        src = tmp_path / ('input' + (suffix if suffix.startswith('.') else f'.{suffix}'))
+        src = tmp_path / ('input' + (suffix if str(suffix).startswith('.') else f'.{suffix or "mp4"}'))
         src.write_bytes(raw)
-        frames_dir = tmp_path / 'frames'
-        frames_dir.mkdir(exist_ok=True)
+        clean = tmp_path / 'clean.mp4'
+        palette = tmp_path / 'palette.png'
+        dst = tmp_path / 'output.gif'
 
-        def extract(vf: str, max_frames: int) -> list[Path]:
-            for old in frames_dir.glob('f_*.png'):
-                old.unlink(missing_ok=True)
-            out_pat = str(frames_dir / 'f_%04d.png')
-            cmd = [
-                'ffmpeg', '-nostdin', '-hide_banner', '-loglevel', 'error', '-y',
-                '-i', str(src),
-                '-map', '0:v:0',
-                '-an',
-                '-t', str(MAX_VIDEO_SECONDS),
-                '-vf', vf,
-                '-pix_fmt', 'rgb24',
-                '-frames:v', str(max_frames),
-                out_pat,
-            ]
-            proc = subprocess.run(cmd, capture_output=True, timeout=60)
-            if proc.returncode != 0:
-                err = (proc.stderr or b'').decode('utf-8', 'ignore')[:300]
-                raise RuntimeError(f'ffmpeg failed: {err or proc.returncode}')
-            return sorted(frames_dir.glob('f_*.png'))
+        side = GIF_MAX_SIDE
+        fps = GIF_FPS
 
-        paths: list[Path] = []
-        attempts = [
-            (f'fps={GIF_FPS},scale={GIF_MAX_SIDE}:-2', GIF_MAX_FRAMES),
-            (f'fps=8,scale=480:-2', 40),
-            (f'fps=6,scale=360:-2', 30),
-            ('fps=5,scale=320:-2', 20),
-        ]
-        last_err = None
-        for vf, nfr in attempts:
+        # 1) Normalize: only first video stream, yuv420p, no audio
+        normalized = False
+        for scale_expr in (
+            f'scale={side}:-2:flags=lanczos,format=yuv420p',
+            f'scale={side}:-2,format=yuv420p',
+            'scale=480:-2,format=yuv420p',
+            'format=yuv420p',
+        ):
             try:
-                paths = extract(vf, nfr)
-                if paths:
+                run([
+                    'ffmpeg', '-nostdin', '-hide_banner', '-loglevel', 'error', '-y',
+                    '-i', str(src),
+                    '-map', '0:v:0',
+                    '-an',
+                    '-sn',
+                    '-dn',
+                    '-t', str(MAX_VIDEO_SECONDS),
+                    '-vf', scale_expr,
+                    '-c:v', 'libx264',
+                    '-preset', 'ultrafast',
+                    '-crf', '28',
+                    '-pix_fmt', 'yuv420p',
+                    '-movflags', '+faststart',
+                    str(clean),
+                ], timeout=90)
+                if clean.exists() and clean.stat().st_size > 0:
+                    normalized = True
+                    break
+            except Exception:
+                clean.unlink(missing_ok=True)
+                continue
+
+        work = clean if normalized else src
+
+        # 2) palettegen + paletteuse (classic path)
+        vf = f'fps={fps},scale={side}:-2:flags=lanczos'
+        made = False
+        last_err = None
+        for vf_try in (
+            vf,
+            f'fps={fps},scale={side}:-2',
+            f'fps=6,scale=360:-2',
+        ):
+            try:
+                run([
+                    'ffmpeg', '-nostdin', '-hide_banner', '-loglevel', 'error', '-y',
+                    '-i', str(work),
+                    '-map', '0:v:0',
+                    '-an',
+                    '-vf', f'{vf_try},palettegen=stats_mode=diff',
+                    str(palette),
+                ], timeout=60)
+                run([
+                    'ffmpeg', '-nostdin', '-hide_banner', '-loglevel', 'error', '-y',
+                    '-i', str(work),
+                    '-i', str(palette),
+                    '-map', '0:v:0',
+                    '-an',
+                    '-lavfi', f'{vf_try}[x];[x][1:v]paletteuse=dither=bayer:bayer_scale=3',
+                    '-loop', '0',
+                    str(dst),
+                ], timeout=60)
+                if dst.exists() and dst.stat().st_size > 0:
+                    made = True
                     break
             except Exception as exc:
                 last_err = exc
-                paths = []
-        if not paths:
-            # single still frame
-            still = tmp_path / 'still.png'
-            cmd = [
-                'ffmpeg', '-nostdin', '-hide_banner', '-loglevel', 'error', '-y',
-                '-i', str(src), '-map', '0:v:0', '-an', '-frames:v', '1',
-                '-pix_fmt', 'rgb24', str(still),
-            ]
-            proc = subprocess.run(cmd, capture_output=True, timeout=30)
-            if proc.returncode != 0 or not still.exists():
-                err = (proc.stderr or b'').decode('utf-8', 'ignore')[:300]
-                raise RuntimeError(f'ffmpeg failed: {err or last_err}')
-            paths = [still]
+                palette.unlink(missing_ok=True)
+                dst.unlink(missing_ok=True)
+                continue
 
-        frames: list[Image.Image] = []
-        for fp in paths[:GIF_MAX_FRAMES]:
-            with Image.open(fp) as im:
-                fr = ImageOps.contain(im.convert('RGB'), (GIF_MAX_SIDE, GIF_MAX_SIDE))
-                if text:
-                    fr = _overlay(fr, text)
-                frames.append(fr.copy())
-        if not frames:
-            raise RuntimeError('هیچ فریمی ساخته نشد.')
+        if not made:
+            # 3) Fallback: direct gif encode
+            try:
+                run([
+                    'ffmpeg', '-nostdin', '-hide_banner', '-loglevel', 'error', '-y',
+                    '-i', str(work),
+                    '-map', '0:v:0',
+                    '-an',
+                    '-t', str(MAX_VIDEO_SECONDS),
+                    '-vf', f'fps=6,scale=360:-2',
+                    '-loop', '0',
+                    str(dst),
+                ], timeout=60)
+                made = dst.exists() and dst.stat().st_size > 0
+            except Exception as exc:
+                last_err = exc
 
-        frames_q = _quantize_gif_frames(frames)
-        out = io.BytesIO()
-        frames_q[0].save(
-            out, format='GIF', save_all=True,
-            append_images=frames_q[1:] if len(frames_q) > 1 else [],
-            loop=0, duration=max(90, int(1000 / max(1, GIF_FPS))), optimize=True,
-        )
-        result = out.getvalue()
+        if not made:
+            raise RuntimeError(f'ffmpeg failed: {last_err or "unknown"}')
 
-        if len(result) > limit and len(frames) > 1:
-            step = max(1, len(frames) // 20)
-            small = [
-                ImageOps.contain(fr, (320, 320)).convert('P', palette=Image.ADAPTIVE, colors=64)
-                for fr in frames[::step][:20]
-            ]
-            out2 = io.BytesIO()
-            small[0].save(out2, format='GIF', save_all=True, append_images=small[1:],
-                          loop=0, duration=120, optimize=True)
-            result = out2.getvalue()
+        result = dst.read_bytes()
+
+        # 4) Optional text overlay via Pillow (stable for Persian)
+        if text and text.strip():
+            try:
+                frames: list[Image.Image] = []
+                with Image.open(io.BytesIO(result)) as gif:
+                    n = min(getattr(gif, 'n_frames', 1) or 1, GIF_MAX_FRAMES)
+                    for i in range(n):
+                        gif.seek(i)
+                        fr = gif.convert('RGB')
+                        fr = _overlay(fr, text.strip())
+                        frames.append(fr.copy())
+                if frames:
+                    frames_q = _quantize_gif_frames(frames)
+                    out = io.BytesIO()
+                    frames_q[0].save(
+                        out, format='GIF', save_all=True,
+                        append_images=frames_q[1:] if len(frames_q) > 1 else [],
+                        loop=0,
+                        duration=max(100, int(1000 / max(1, fps))),
+                        optimize=True,
+                    )
+                    result = out.getvalue()
+            except Exception:
+                # keep gif without text rather than fail entirely
+                pass
+
+        if len(result) > limit:
+            # shrink pass on clean source
+            small = tmp_path / 'small.gif'
+            try:
+                run([
+                    'ffmpeg', '-nostdin', '-hide_banner', '-loglevel', 'error', '-y',
+                    '-i', str(work),
+                    '-map', '0:v:0', '-an',
+                    '-vf', 'fps=5,scale=320:-2',
+                    '-loop', '0', str(small),
+                ], timeout=60)
+                if small.exists():
+                    result = small.read_bytes()
+                    if text and text.strip():
+                        try:
+                            frames = []
+                            with Image.open(io.BytesIO(result)) as gif:
+                                n = min(getattr(gif, 'n_frames', 1) or 1, 24)
+                                for i in range(n):
+                                    gif.seek(i)
+                                    fr = _overlay(gif.convert('RGB'), text.strip())
+                                    frames.append(fr.copy())
+                            if frames:
+                                fq = _quantize_gif_frames(frames)
+                                out = io.BytesIO()
+                                fq[0].save(out, format='GIF', save_all=True, append_images=fq[1:],
+                                           loop=0, duration=120, optimize=True)
+                                result = out.getvalue()
+                        except Exception:
+                            pass
+            except Exception:
+                pass
 
         hard_cap = MAX_OUTPUT_LONG if long_source else MAX_OUTPUT_BYTES
         if len(result) > hard_cap:

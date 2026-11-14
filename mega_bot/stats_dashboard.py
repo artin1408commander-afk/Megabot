@@ -280,7 +280,7 @@ def render_group_dashboard(
     max_v = max(series) if series else 0
     if max_v <= 0:
         _t(draw, ((cx1 + cx2) // 2, (cy1 + cy2) // 2),
-           'دادهٔ کافی نیست — از زمان فعال‌شدن ثبت آمار', f_body, MUTED, 'mm')
+           'دادهٔ کافی نیست', f_body, MUTED, 'mm')
     else:
         for g in range(4):
             gy = cy1 + int((cy2 - cy1) * g / 3)
@@ -379,11 +379,7 @@ def render_group_dashboard(
             _t(draw, (m + 28 + bw // 2, (y1 + y2) // 2), badge, f_small, TEXT, 'mm')
 
     # footer
-    note = 'آمار از زمان شروع ثبت'
-    if tracking:
-        note = f'ثبت از {tracking}'
-    _t(draw, (m + 8, H - 36), note, f_tiny, MUTED, 'lt')
-    _t(draw, (W - m - 8, H - 36), 'MEGA BOT  ·  Generated stats', f_tiny, MUTED, 'rt')
+    _t(draw, (W - m - 8, H - 36), 'MEGA BOT', f_tiny, MUTED, 'rt')
 
     buf = BytesIO()
     img.save(buf, format='PNG', optimize=False, compress_level=3)

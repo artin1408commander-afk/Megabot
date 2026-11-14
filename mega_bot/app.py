@@ -6810,7 +6810,7 @@ class MegaBot:
             f'🆔 شناسه: `{chat_id}`',
             f'👥 اعضا: {mem_s}',
             '',
-            '⏱ بازه: ۲۴ ساعت اخیر (داده‌های ثبت‌شده)',
+            '⏱ بازه: ۲۴ ساعت اخیر',
             f'💬 پیام‌ها: {n(total)}',
             f'👤 کاربران فعال: {n(active)}',
             f'🟢 ورود: {n(joined)}  |  🔴 خروج: {n(left)}  |  رشد خالص: {n(net)}',
@@ -6834,13 +6834,6 @@ class MegaBot:
             for i, u in enumerate(tops[:5], 1):
                 nm = u.get('name') or u.get('first_name') or u.get('username') or str(u.get('user_id'))
                 lines.append(f'  {i}. {nm} — {n(u.get("msg_count", 0))} پیام')
-        lines.append('')
-        if tracking:
-            lines.append(f'ℹ️ ثبت آمار از: {tracking}')
-        else:
-            lines.append('ℹ️ فقط پیام‌های پس از فعال‌شدن ربات شمرده می‌شوند.')
-        lines.append('📌 اعداد واقعی از دیتابیس · نسخه متنی آمار v1.2.2')
-
         await self.safe_send(chat_id, '\n'.join(lines), parse_mode=None)
 
 

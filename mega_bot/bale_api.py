@@ -258,16 +258,8 @@ class BaleAPI:
                 elif btn.get('copy_text'):
                     clean['copy_text'] = btn['copy_text']
                 st = btn.get('style')
-                if st not in ('primary', 'success', 'danger'):
-                    # infer from label text
-                    lab = clean['text']
-                    if any(x in lab for x in ('لغو', 'انصراف', 'بستن', 'بازگشت', 'حذف', 'بن', '❌', '✖️', '🚫', 'خاموش')):
-                        st = 'danger'
-                    elif any(x in lab for x in ('تأیید', 'تایید', 'بله', 'ذخیره', 'ارسال', '✅', 'روشن')):
-                        st = 'success'
-                    else:
-                        st = 'primary'
-                clean['style'] = st
+                if st in ('primary', 'success', 'danger'):
+                    clean['style'] = st
                 if isinstance(btn.get('disabled'), dict):
                     clean['disabled'] = {}
                 new_row.append(clean)

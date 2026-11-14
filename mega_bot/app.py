@@ -3202,8 +3202,8 @@ class MegaBot:
         return f'یه نفر مارو حمایت کرد🥹✨️\n{amount_line}'
 
     def donation_broadcast_keyboard(self) -> dict:
-        """Inline button under every public donation announcement."""
-        return inline([[('توهم حمایت کن 🌱', 'donate:start')]])
+        """Glass button (no style) under public donation announcements."""
+        return {'inline_keyboard': [[{'text': 'منم حمایت کنم', 'callback_data': 'donate:start'}]]}
 
     async def show_donation_intro(self, chat_id: int, edit_id: int | None = None) -> None:
         intro = await self.db.get_setting(
@@ -3395,77 +3395,64 @@ class MegaBot:
         owner_message_id: int,
         amount: int,
     ) -> None:
-        """Send approved donation notice to PVs, groups, and announce channel."""
+        """Fast parallel broadcast of approved donation to PV + groups + channel."""
         announcement = self.build_donation_announcement(donation)
         keyboard = self.donation_broadcast_keyboard()
-        sent = failed = 0
-        channel_ok = False
         channel_target = self._donation_announce_channel()
+        sent = 0
+        failed = 0
+        channel_ok = False
+        lock = asyncio.Lock()
+        sem = asyncio.Semaphore(12)
 
-        async def _one(target, *, is_channel: bool = False) -> bool:
+        async def _one(target) -> bool:
             nonlocal sent, failed
-            try:
-                await self.safe_send(
-                    target,
-                    announcement,
-                    keyboard=keyboard,
-                    parse_mode='Markdown',
-                    permanent=True,
-                    skip_ad=True,
-                )
-                sent += 1
-                return True
-            except Exception as exc:
-                # retry plain text
+            async with sem:
+                dest = int(target) if str(target).lstrip('-').isdigit() else target
                 try:
-                    await self.safe_send(
-                        target,
-                        announcement,
-                        parse_mode=None,
-                        permanent=True,
-                        skip_ad=True,
-                    )
-                    sent += 1
-                    return True
-                except Exception as exc2:
+                    res = await self.api.send_message(dest, announcement, keyboard, None, 'Markdown', fast=True)
+                    if res is not None:
+                        async with lock:
+                            sent += 1
+                        return True
+                except Exception:
+                    pass
+                try:
+                    plain = (announcement or '').replace('*', '').replace('`', '')
+                    res = await self.api.send_message(dest, plain, keyboard, None, None, fast=True)
+                    if res is not None:
+                        async with lock:
+                            sent += 1
+                        return True
+                except Exception as exc:
+                    log.debug('donation bc fail target=%s: %s', target, type(exc).__name__)
+                async with lock:
                     failed += 1
-                    log.debug(
-                        'donation bc fail target=%s channel=%s: %s/%s',
-                        target, is_channel, type(exc).__name__, type(exc2).__name__,
-                    )
-                    return False
+                return False
 
-        # 1) Dedicated announce channel first
-        try:
-            ok = await _one(channel_target, is_channel=True)
-            channel_ok = ok
-            if ok:
-                log.info('donation #%s announced to channel %s', donation_id, channel_target)
-        except Exception as exc:
-            log.warning('donation channel announce failed: %s', type(exc).__name__)
-
-        # 2) Private users
+        targets: list[tuple[str, object]] = []
+        if channel_target:
+            targets.append(('channel', channel_target))
         try:
             pv_targets = await self.db.private_user_ids()
         except Exception:
             log.exception('private_user_ids failed')
             pv_targets = []
-        for target_id in pv_targets:
-            await _one(int(target_id))
-            if (sent + failed) % 25 == 0:
-                await asyncio.sleep(0.05)
-
-        # 3) Groups / known chats (including channels the bot is in)
+        for u in pv_targets:
+            targets.append(('pv', int(u)))
         try:
             group_targets = await self.db.channel_chat_ids()
         except Exception:
             try:
                 group_targets = await self.db.group_chat_ids()
             except Exception:
-                log.exception('group/channel ids failed')
                 group_targets = []
-        # Avoid double-send to same id / numeric form of announce channel
-        seen = set(int(x) for x in pv_targets if str(x).lstrip('-').isdigit())
+        seen: set[int] = set()
+        for u in pv_targets:
+            try:
+                seen.add(int(u))
+            except Exception:
+                pass
         for gid in group_targets:
             try:
                 gi = int(gid)
@@ -3474,9 +3461,30 @@ class MegaBot:
             if gi in seen:
                 continue
             seen.add(gi)
-            await _one(gi)
-            if (sent + failed) % 20 == 0:
-                await asyncio.sleep(0.08)
+            targets.append(('group', gi))
+
+        total = len(targets)
+        log.info('donation #%s broadcast start targets=%s', donation_id, total)
+
+        for kind, tid in targets:
+            if kind == 'channel':
+                channel_ok = await _one(tid)
+                break
+        rest = [(k, tid) for k, tid in targets if k != 'channel']
+        batch_size = 40
+        for i in range(0, len(rest), batch_size):
+            chunk = rest[i:i + batch_size]
+            await asyncio.gather(*[_one(tid) for _, tid in chunk], return_exceptions=True)
+            try:
+                await self.api.edit_message(
+                    owner_chat_id,
+                    owner_message_id,
+                    f'⏳ همگانی حمایت #{donation_id}\nپیشرفت: {sent + failed}/{total}\nموفق: {sent} | ناموفق: {failed}'.replace('\\n', chr(10)),
+                    None,
+                    None,
+                )
+            except Exception:
+                pass
 
         try:
             await self.db.set_donation_broadcast_counts(donation_id, sent, failed)
@@ -3484,28 +3492,35 @@ class MegaBot:
         except Exception:
             log.exception('set_donation_broadcast_counts failed')
 
-        summary = (
-            f'✅ حمایت `#{donation_id}` تأیید شد.\n'
-            f'مبلغ {amount:,} تومان به آمار اضافه شد.\n'
-            f'ارسال همگانی: {sent} موفق، {failed} ناموفق.\n'
-            f'کانال ({channel_target}): {"✅" if channel_ok else "❌ ربات باید در کانال عضو/ادمین باشد"}.'
-        )
+        lines = [
+            f'✅ حمایت #{donation_id} تأیید و همگانی شد.',
+            f'مبلغ: {amount:,} تومان',
+            f'ارسال: {sent} موفق از {total} مخاطب',
+            f'ناموفق: {failed}',
+            f'کانال ({channel_target}): ' + ('✅ ارسال شد' if channel_ok else '❌ عضو/ادمین نیست یا خطا'),
+            'مقاصد: پیوی + گروه‌ها + کانال',
+        ]
+        summary = chr(10).join(lines)
         try:
-            await self.safe_edit(owner_chat_id, owner_message_id, summary, None)
+            await self.api.edit_message(owner_chat_id, owner_message_id, summary, None, None)
         except Exception:
             try:
-                await self.safe_send(owner_chat_id, summary, permanent=True)
+                await self.safe_send(owner_chat_id, summary, permanent=True, skip_ad=True, parse_mode=None)
             except Exception:
-                pass
+                log.exception('donation final report failed')
         try:
-            await self.safe_send(
-                int(donation['user_id']),
-                '💚 حمایت مالی‌ات تأیید شد و مبلغ به آمار ربات اضافه شد! از همراهی‌ت ممنونیم 🌱😊',
-                USER_KEYBOARD,
-                permanent=True,
-            )
-        except Exception as exc:
-            log.debug('Donor success notice failed for %s: %s', donation.get('user_id'), type(exc).__name__)
+            donor_id = int(donation.get('user_id') or 0)
+            if donor_id:
+                await self.safe_send(
+                    donor_id,
+                    f'✅ حمایتت به مبلغ {amount:,} تومان تأیید شد. ممنون از همراهی‌ات 🌱',
+                    permanent=True,
+                    skip_ad=True,
+                    parse_mode=None,
+                )
+        except Exception:
+            pass
+        log.info('donation #%s broadcast done sent=%s failed=%s total=%s', donation_id, sent, failed, total)
 
 
     def stats_text(self, s: dict) -> str:
@@ -4947,16 +4962,38 @@ class MegaBot:
                     if 'blocked' in err or 'forbidden' in err or 'chat not found' in err or 'have no rights' in err:
                         blocked += 1
                     log.warning('broadcast dest=%s err=%s', dest, type(exc).__name__)
-                # Rate limit: ~15 msg/sec max, stay conservative
-                if idx % 10 == 9:
-                    await asyncio.sleep(1.0)
+                # Faster rate; progress every 50
+                if idx % 25 == 24:
+                    await asyncio.sleep(0.3)
                 else:
-                    await asyncio.sleep(0.08)
-            await self.safe_send(
-                report_chat,
-                f'✅ *گزارش پیام همگانی*\nمخاطبان هدف: {total}\nموفق: {sent}\nناموفق: {failed}\nمسدود/غیرقابل‌دسترسی: {blocked}\nباقی‌مانده: 0',
-                skip_ad=True,
-            )
+                    await asyncio.sleep(0.03)
+                if idx > 0 and idx % 50 == 49:
+                    try:
+                        await self.safe_send(
+                            report_chat,
+                            f'⏳ پیشرفت همگانی: {idx+1}/{total} | موفق {sent} | ناموفق {failed}',
+                            skip_ad=True,
+                            parse_mode=None,
+                        )
+                    except Exception:
+                        pass
+            report = (
+                f'✅ گزارش پیام همگانی\n'
+                f'مخاطبان هدف: {total}\n'
+                f'موفق: {sent}\n'
+                f'ناموفق: {failed}\n'
+                f'مسدود/غیرقابل‌دسترسی: {blocked}\n'
+                f'باقی‌مانده: 0'
+            ).replace('\\n', chr(10))
+            report = chr(10).join([
+                '✅ گزارش پیام همگانی',
+                f'مخاطبان هدف: {total}',
+                f'موفق: {sent}',
+                f'ناموفق: {failed}',
+                f'مسدود/غیرقابل‌دسترسی: {blocked}',
+                'باقی‌مانده: 0',
+            ])
+            await self.safe_send(report_chat, report, skip_ad=True, parse_mode=None)
             await self.db.log(admin_uid, 'broadcast_done', details={
                 'target': target, 'total': total, 'sent': sent, 'failed': failed, 'blocked': blocked, 'kind': kind,
             })

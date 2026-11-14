@@ -1663,41 +1663,44 @@ class MegaBot:
             await self.db.remove_force_join(jid, scope='group', host_chat_id=int(chat_id))
             await self._show_group_force_join_panel(chat_id, message_id)
             return
-        if data.startswith('fj:v:g:'):
-            # verify global memberships
-            target_uid = int(data.split(':')[-1])
-            if int(uid) != target_uid and uid != OWNER_ID:
-                await self.api.answer_callback(callback_id, 'این دکمه برای تو نیست', show_alert=True)
-                return
-            items = await self.db.list_force_joins('global', 0)
-            missing = await self._missing_force_joins(target_uid, items)
-            if not missing:
-                await self.safe_edit(chat_id, message_id, '✅ تایید شد — عضویت کامل است.', None)
-                await self.api.answer_callback(callback_id, 'تایید شد')
-                return
-            kb = self._force_join_keyboard(missing, verify_cb=f'fj:v:g:{target_uid}')
-            await self.safe_edit(chat_id, message_id, 'ابتدا عضو گروه/کانال های زیر شوید✅️', kb)
-            await self.api.answer_callback(callback_id, 'هنوز عضو نیستی')
-            return
-        if data.startswith('fj:v:l:'):
-            parts = data.split(':')
-            # fj:v:l:{chat}:{uid}
+        if data.startswith('fj:v:g:') or data.startswith('fj:v:l:'):
+            # Verify force-join memberships (callback already answered upstream).
             try:
-                host = int(parts[3]); target_uid = int(parts[4])
+                if data.startswith('fj:v:g:'):
+                    target_uid = int(data.split(':')[-1])
+                    host = 0
+                    scope = 'global'
+                else:
+                    parts = data.split(':')
+                    host = int(parts[3])
+                    target_uid = int(parts[4])
+                    scope = 'group'
             except Exception:
+                await self.safe_edit(chat_id, message_id, 'داده دکمه نامعتبر است.', None)
                 return
-            if int(uid) != target_uid and uid != OWNER_ID:
-                await self.api.answer_callback(callback_id, 'این دکمه برای تو نیست', show_alert=True)
+            if int(uid) != int(target_uid) and int(uid) != int(OWNER_ID):
+                await self.safe_send(chat_id, '⛔ این دکمه برای تو نیست.', parse_mode=None)
                 return
-            items = await self.db.list_force_joins('group', host)
-            missing = await self._missing_force_joins(target_uid, items)
+            try:
+                items = await self.db.list_force_joins(scope, int(host))
+            except Exception:
+                log.exception('list_force_joins failed scope=%s host=%s', scope, host)
+                await self.safe_edit(chat_id, message_id, 'خطا در خواندن لیست جوین اجباری. دوباره تلاش کن.', None)
+                return
+            try:
+                missing = await self._missing_force_joins(int(target_uid), items)
+            except Exception:
+                log.exception('missing_force_joins failed')
+                await self.safe_edit(chat_id, message_id, 'خطا در بررسی عضویت. کمی بعد دوباره «تایید عضویت» را بزن.', None)
+                return
             if not missing:
-                await self.safe_edit(chat_id, message_id, '✅ تایید شد — می‌تونی صحبت کنی.', None)
-                await self.api.answer_callback(callback_id, 'تایید شد')
+                msg_ok = '✅ تایید شد — عضویت کامل است.' if scope == 'global' else '✅ تایید شد — می‌تونی صحبت کنی.'
+                await self.safe_edit(chat_id, message_id, msg_ok, None)
                 return
-            kb = self._force_join_keyboard(missing, verify_cb=f'fj:v:l:{host}:{target_uid}')
-            await self.safe_edit(chat_id, message_id, 'ابتدا عضو این گروه / کانال شو', kb)
-            await self.api.answer_callback(callback_id, 'هنوز عضو نیستی')
+            verify_cb = f'fj:v:g:{target_uid}' if scope == 'global' else f'fj:v:l:{host}:{target_uid}'
+            kb = self._force_join_keyboard(missing, verify_cb=verify_cb)
+            body = 'ابتدا عضو گروه/کانال های زیر شوید✅️' if scope == 'global' else 'ابتدا عضو این گروه / کانال شو'
+            await self.safe_edit(chat_id, message_id, body, kb)
             return
 
 
@@ -7823,8 +7826,12 @@ class MegaBot:
     _MEMBER_OK = frozenset({'creator', 'administrator', 'member', 'restricted'})
 
     async def _user_in_chat(self, target_chat_id, user_id: int) -> bool:
-        st = await self.api.get_chat_member_status(target_chat_id, user_id)
-        return bool(st and st in self._MEMBER_OK)
+        try:
+            st = await self.api.get_chat_member_status(target_chat_id, int(user_id))
+            return bool(st and st in self._MEMBER_OK)
+        except Exception as exc:
+            log.warning('getChatMember failed chat=%s user=%s: %s', target_chat_id, user_id, type(exc).__name__)
+            return False
 
     async def _bot_in_chat(self, target_chat_id) -> bool:
         bot_id = getattr(self, 'bot_id', None)
@@ -7853,23 +7860,23 @@ class MegaBot:
         return [{'text': '🟢 ' + title, 'url': url, 'style': 'success'}]
 
     def _force_join_keyboard(self, missing: list[dict], *, verify_cb: str) -> dict:
+        """Green URL buttons per channel + verify callback."""
         rows = []
         for it in missing:
-            row = self._force_join_button_row(it)
-            # normalize to dict buttons for url
-            out = []
-            for cell in row:
-                if isinstance(cell, dict):
-                    out.append(cell)
-                else:
-                    # (label, data, style)
-                    b = {'text': cell[0], 'callback_data': cell[1]}
-                    if len(cell) > 2:
-                        b['style'] = cell[2]
-                    out.append(b)
-            rows.append(out)
-        rows.append([{'text': '✅ تایید عضویت', 'callback_data': verify_cb, 'style': 'success'}])
+            title = (it.get('target_title') or it.get('target_username') or str(it.get('target_chat_id')))[:40]
+            uname = (it.get('target_username') or '').lstrip('@')
+            link = it.get('invite_link') or ''
+            if uname:
+                url = f'https://ble.ir/{uname}'
+            elif link:
+                url = link
+            else:
+                rows.append([{'text': f'🟢 {title}', 'callback_data': f'fj:info:{it.get("id", 0)}'}])
+                continue
+            rows.append([{'text': f'🟢 {title}', 'url': url}])
+        rows.append([{'text': '✅ تایید عضویت', 'callback_data': str(verify_cb)}])
         return {'inline_keyboard': rows}
+
 
     async def _missing_force_joins(self, user_id: int, items: list[dict]) -> list[dict]:
         missing = []

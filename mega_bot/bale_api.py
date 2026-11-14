@@ -258,8 +258,16 @@ class BaleAPI:
                 elif btn.get('copy_text'):
                     clean['copy_text'] = btn['copy_text']
                 st = btn.get('style')
-                if st in ('primary', 'success', 'danger'):
-                    clean['style'] = st
+                if st not in ('primary', 'success', 'danger'):
+                    # infer from label text
+                    lab = clean['text']
+                    if any(x in lab for x in ('لغو', 'انصراف', 'بستن', 'بازگشت', 'حذف', 'بن', '❌', '✖️', '🚫', 'خاموش')):
+                        st = 'danger'
+                    elif any(x in lab for x in ('تأیید', 'تایید', 'بله', 'ذخیره', 'ارسال', '✅', 'روشن')):
+                        st = 'success'
+                    else:
+                        st = 'primary'
+                clean['style'] = st
                 if isinstance(btn.get('disabled'), dict):
                     clean['disabled'] = {}
                 new_row.append(clean)
@@ -268,16 +276,13 @@ class BaleAPI:
         return {'inline_keyboard': new_rows}
 
     def _encode_reply_markup(self, reply_markup: dict | None) -> dict | str | None:
-        """Bale expects reply_markup as JSON-serialized value.
+        """Normalize markup for Bale.
 
-        We send a JSON *string* (still valid inside application/json body) so the
-        style field is not dropped by gateways that re-parse markup loosely.
+        With application/json body, reply_markup must be a nested object (not a
+        double-encoded string). Style values per docs.bale.ai:
+        primary | success | danger
         """
-        rm = self._normalize_reply_markup(reply_markup)
-        if rm is None:
-            return None
-        # String form — matches docs wording «JSON-serialized»
-        return json.dumps(rm, ensure_ascii=False, separators=(',', ':'))
+        return self._normalize_reply_markup(reply_markup)
 
 
     async def send_message(
@@ -457,7 +462,7 @@ class BaleAPI:
         if parse_mode:
             form.add_field('parse_mode', parse_mode)
         if reply_markup is not None:
-            form.add_field('reply_markup', self._encode_reply_markup(reply_markup) if isinstance(reply_markup, dict) else json.dumps(reply_markup, ensure_ascii=False))
+            form.add_field('reply_markup', json.dumps(self._normalize_reply_markup(reply_markup) if isinstance(reply_markup, dict) else reply_markup, ensure_ascii=False))
         if reply_to is not None:
             form.add_field('reply_to_message_id', str(int(reply_to)))
         form.add_field('photo', data, filename=filename, content_type='image/png')

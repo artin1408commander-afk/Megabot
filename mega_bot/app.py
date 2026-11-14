@@ -175,7 +175,7 @@ class MegaBot:
         enabled, url, title = await self._get_ad_config()
         if not enabled or not url or not title:
             return keyboard
-        ad_btn = {'text': title, 'url': url}
+        ad_btn = {'text': title, 'url': url, 'style': 'primary'}
         if keyboard and 'inline_keyboard' in keyboard:
             return merge_inline(keyboard, [ad_btn])
         if keyboard and 'keyboard' in keyboard:
@@ -956,6 +956,32 @@ class MegaBot:
                 f'اعداد فارسی یا انگلیسی؛ صفر مجاز است.\n'
                 f'برای لغو: لغو',
                 parse_mode=None,
+            )
+            return
+
+
+        if text in ('تست رنگ', 'تست دکمه', '/testcolor'):
+            if uid != OWNER_ID:
+                await self.safe_send(chat_id, '⛔ فقط مالک.', parse_mode=None)
+                return
+            # Exact sample from docs.bale.ai — must show green/red if client supports style
+            kb = {
+                'inline_keyboard': [
+                    [
+                        {'text': 'تأیید سبز', 'callback_data': 'close', 'style': 'success'},
+                        {'text': 'لغو قرمز', 'callback_data': 'close', 'style': 'danger'},
+                    ],
+                    [
+                        {'text': 'اصلی primary', 'callback_data': 'close', 'style': 'primary'},
+                    ],
+                ]
+            }
+            await self.safe_send(
+                chat_id,
+                '🧪 تست رنگ دکمه (مستندات بله)\nاگر کلاینت پشتیبانی کند: سبز / قرمز / فیروزه‌ای',
+                kb,
+                parse_mode=None,
+                permanent=True,
             )
             return
 

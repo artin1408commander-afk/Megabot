@@ -8,7 +8,7 @@ from .bale_api import BaleAPI, BaleAPIError
 from .database import Database
 from .media_tools import convert_media, MAX_INPUT_BYTES
 from .messaging import MessageHub
-from .keyboards import USER_KEYBOARD, inline, menu_page, main_admin_menu, user_actions, url_button, merge_inline, STYLE_SUCCESS, STYLE_DANGER, STYLE_PRIMARY
+from .keyboards import USER_KEYBOARD, inline, menu_page, main_admin_menu, user_actions, url_button, merge_inline, STYLE_SUCCESS, STYLE_DANGER, STYLE_PRIMARY, paint_keyboard
 from . import prices as price_mod
 from . import fun_content
 from .profanity import contains_profanity, extract_urls, text_similarity, collapse_for_match
@@ -435,6 +435,11 @@ class MegaBot:
             )
 
     async def safe_edit(self, chat_id: int, message_id: int, text: str, keyboard: dict | None = None) -> None:
+        try:
+            if keyboard and isinstance(keyboard, dict) and 'inline_keyboard' in keyboard:
+                keyboard = paint_keyboard(keyboard)
+        except Exception:
+            pass
         try:
             await self.api.edit_message(chat_id, message_id, text, keyboard)
         except Exception as exc:

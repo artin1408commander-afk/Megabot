@@ -200,16 +200,42 @@ class BaleAPI:
         )
 
 
-    @staticmethod
-    def _normalize_reply_markup(reply_markup: dict | None) -> dict | str | None:
-        """Ensure inline buttons carry official Bale/Telegram style values.
 
-        Bale docs (docs.bale.ai): style ∈ {primary, success, danger}.
-        Some gateways expect reply_markup as a JSON *string*; we keep object for
-        application/json POST which aiohttp uses, after sanitizing each button.
+    @staticmethod
+    def _normalize_reply_markup(reply_markup: dict | None) -> dict | None:
+        """Sanitize inline keyboard; keep official Bale style values.
+
+        docs.bale.ai — style ∈ {primary, success, danger}
+        Example:
+          {"text":"تأیید","callback_data":"confirm","style":"success"}
         """
         if not reply_markup or not isinstance(reply_markup, dict):
             return reply_markup
+        # Reply keyboard (not inline) — pass through, optional style on buttons
+        if 'keyboard' in reply_markup and 'inline_keyboard' not in reply_markup:
+            rows = reply_markup.get('keyboard') or []
+            new_rows = []
+            for row in rows:
+                if not isinstance(row, list):
+                    continue
+                nr = []
+                for btn in row:
+                    if isinstance(btn, str):
+                        nr.append({'text': btn})
+                    elif isinstance(btn, dict) and 'text' in btn:
+                        clean = {'text': str(btn['text'])}
+                        for k in ('request_contact', 'request_location', 'web_app'):
+                            if k in btn:
+                                clean[k] = btn[k]
+                        st = btn.get('style')
+                        if st in ('primary', 'success', 'danger'):
+                            clean['style'] = st
+                        nr.append(clean)
+                if nr:
+                    new_rows.append(nr)
+            out = dict(reply_markup)
+            out['keyboard'] = new_rows
+            return out
         rows = reply_markup.get('inline_keyboard')
         if not isinstance(rows, list):
             return reply_markup
@@ -222,15 +248,15 @@ class BaleAPI:
                 if not isinstance(btn, dict) or 'text' not in btn:
                     continue
                 clean: dict = {'text': str(btn['text'])}
+                # Exactly one action field (+ style allowed)
                 if btn.get('callback_data') is not None:
                     clean['callback_data'] = str(btn['callback_data'])[:64]
-                if btn.get('url'):
+                elif btn.get('url'):
                     clean['url'] = str(btn['url'])
-                if btn.get('web_app'):
+                elif btn.get('web_app'):
                     clean['web_app'] = btn['web_app']
-                if btn.get('copy_text'):
+                elif btn.get('copy_text'):
                     clean['copy_text'] = btn['copy_text']
-                # Official Bale button colors
                 st = btn.get('style')
                 if st in ('primary', 'success', 'danger'):
                     clean['style'] = st
@@ -240,6 +266,19 @@ class BaleAPI:
             if new_row:
                 new_rows.append(new_row)
         return {'inline_keyboard': new_rows}
+
+    def _encode_reply_markup(self, reply_markup: dict | None) -> dict | str | None:
+        """Bale expects reply_markup as JSON-serialized value.
+
+        We send a JSON *string* (still valid inside application/json body) so the
+        style field is not dropped by gateways that re-parse markup loosely.
+        """
+        rm = self._normalize_reply_markup(reply_markup)
+        if rm is None:
+            return None
+        # String form — matches docs wording «JSON-serialized»
+        return json.dumps(rm, ensure_ascii=False, separators=(',', ':'))
+
 
     async def send_message(
         self,
@@ -253,7 +292,7 @@ class BaleAPI:
     ) -> dict:
         payload: dict[str, Any] = {'chat_id': chat_id, 'text': text}
         if reply_markup is not None:
-            payload['reply_markup'] = self._normalize_reply_markup(reply_markup)
+            payload['reply_markup'] = self._encode_reply_markup(reply_markup)
         if reply_to_message_id is not None:
             payload['reply_to_message_id'] = reply_to_message_id
         if parse_mode:
@@ -265,7 +304,7 @@ class BaleAPI:
     async def edit_message(self, chat_id: int, message_id: int, text: str, reply_markup: dict | None = None, parse_mode: str | None = 'Markdown') -> dict:
         payload: dict[str, Any] = {'chat_id': chat_id, 'message_id': message_id, 'text': text}
         if reply_markup is not None:
-            payload['reply_markup'] = self._normalize_reply_markup(reply_markup)
+            payload['reply_markup'] = self._encode_reply_markup(reply_markup)
         if parse_mode:
             payload['parse_mode'] = parse_mode
         return await self.call('editMessageText', payload)
@@ -418,7 +457,7 @@ class BaleAPI:
         if parse_mode:
             form.add_field('parse_mode', parse_mode)
         if reply_markup is not None:
-            form.add_field('reply_markup', json.dumps(reply_markup, ensure_ascii=False))
+            form.add_field('reply_markup', self._encode_reply_markup(reply_markup) if isinstance(reply_markup, dict) else json.dumps(reply_markup, ensure_ascii=False))
         if reply_to is not None:
             form.add_field('reply_to_message_id', str(int(reply_to)))
         form.add_field('photo', data, filename=filename, content_type='image/png')
@@ -441,7 +480,7 @@ class BaleAPI:
         if caption:
             payload['caption'] = caption
         if reply_markup is not None:
-            payload['reply_markup'] = reply_markup
+            payload['reply_markup'] = self._encode_reply_markup(reply_markup) if isinstance(reply_markup, dict) else reply_markup
         if parse_mode:
             payload['parse_mode'] = parse_mode
         if reply_to is not None:
@@ -453,7 +492,7 @@ class BaleAPI:
         if caption:
             payload['caption'] = caption
         if reply_markup is not None:
-            payload['reply_markup'] = reply_markup
+            payload['reply_markup'] = self._encode_reply_markup(reply_markup) if isinstance(reply_markup, dict) else reply_markup
         if parse_mode:
             payload['parse_mode'] = parse_mode
         return await self.call('sendVideo', payload, retries=0)
@@ -490,7 +529,7 @@ class BaleAPI:
         if caption:
             payload['caption'] = caption
         if reply_markup is not None:
-            payload['reply_markup'] = reply_markup
+            payload['reply_markup'] = self._encode_reply_markup(reply_markup) if isinstance(reply_markup, dict) else reply_markup
         if parse_mode:
             payload['parse_mode'] = parse_mode
         return await self.call('sendDocument', payload, retries=0)
@@ -500,7 +539,7 @@ class BaleAPI:
         if caption:
             payload['caption'] = caption
         if reply_markup is not None:
-            payload['reply_markup'] = reply_markup
+            payload['reply_markup'] = self._encode_reply_markup(reply_markup) if isinstance(reply_markup, dict) else reply_markup
         if parse_mode:
             payload['parse_mode'] = parse_mode
         return await self.call('sendAnimation', payload, retries=0)
@@ -508,7 +547,7 @@ class BaleAPI:
     async def copy_message(self, chat_id: int, from_chat_id: int, message_id: int, reply_markup: dict | None = None) -> dict:
         payload: dict[str, Any] = {'chat_id': chat_id, 'from_chat_id': from_chat_id, 'message_id': message_id}
         if reply_markup is not None:
-            payload['reply_markup'] = reply_markup
+            payload['reply_markup'] = self._encode_reply_markup(reply_markup) if isinstance(reply_markup, dict) else reply_markup
         return await self.call('copyMessage', payload, retries=0)
 
     async def ban_chat_member(self, chat_id: int, user_id: int, until_date: int | None = None) -> dict:

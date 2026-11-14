@@ -3692,17 +3692,17 @@ class MegaBot:
         new_today = s.get('new_today', 0)
         new_month = s.get('new_month', 0)
         active_month = s.get('active_month', 0)
-        groups = s.get('groups', 0)
+        groups = s.get('groups_registered', s.get('groups', 0))
         banned_u = s.get('banned_users', 0)
         banned_g = s.get('banned_groups', 0)
         donations = s.get('donations', 0)
         return (
             '*📊 مرکز اطلاعات مگا*'
             + chr(10) + '━━━━━━━━━━━━━━━━━━'
-            + chr(10) + f'*👤 کاربران پیوی (کل):* {users}'
-            + chr(10) + f'*🆕 کاربران جدید امروز (پیوی):* {new_today}'
-            + chr(10) + f'*📅 کاربران جدید این ماه (پیوی):* {new_month}'
-            + chr(10) + f'*⚡ فعال این ماه (پیوی):* {active_month}'
+            + chr(10) + f'*👤 کاربران (کل):* {users}'
+            + chr(10) + f'*🆕 کاربران جدید امروز:* {new_today}'
+            + chr(10) + f'*📅 کاربران جدید این ماه:* {new_month}'
+            + chr(10) + f'*⚡ فعال این ماه:* {active_month}'
             + chr(10) + f'*👥 گروه‌های ثبت‌شده:* {groups}'
             + chr(10) + f'*⛔ محدودیت فعال کاربران:* {banned_u}'
             + chr(10) + f'*🚫 گروه‌های محدود:* {banned_g}'
@@ -5174,34 +5174,91 @@ class MegaBot:
             self._broadcast_cancel.discard(admin_uid)
 
     async def _broadcast_one(self, dest: int, payload: dict) -> bool:
+        """Send one broadcast item. Count success only when API returns a message result."""
         kind = payload.get('kind', 'text')
         kb = None
-        # Attach ad unless GIF
         if kind != 'animation':
-            kb = await self._with_ad_keyboard(None)
+            try:
+                kb = await self._with_ad_keyboard(None)
+            except Exception:
+                kb = None
+
+        def _ok(result) -> bool:
+            if result is None:
+                return False
+            if isinstance(result, dict):
+                # Bale/Telegram sendMessage result is a Message with message_id
+                if result.get('message_id') is not None:
+                    return True
+                # some wrappers return full envelope
+                if result.get('ok') is True:
+                    return True
+                # empty dict → fail
+                return bool(result)
+            return True
+
         try:
             if kind == 'text':
-                result = await self.api.send_message(dest, payload['text'], kb, None, payload.get('parse_mode'), fast=True)
-            elif kind == 'photo':
-                result = await self.api.send_photo(dest, payload['file_id'], payload.get('caption'), kb, payload.get('parse_mode'))
-            elif kind == 'video':
-                result = await self.api.send_video(dest, payload['file_id'], payload.get('caption'), kb, payload.get('parse_mode'))
-            elif kind == 'document':
-                result = await self.api.send_document(dest, payload['file_id'], payload.get('caption'), kb, payload.get('parse_mode'))
-            elif kind == 'animation':
-                result = await self.api.send_animation_file_id(dest, payload['file_id'], payload.get('caption'), None, payload.get('parse_mode'))
-            elif kind == 'copy':
-                result = await self.api.copy_message(dest, payload['from_chat_id'], payload['message_id'], kb)
-            else:
+                text = payload.get('text') or ''
+                modes = []
+                pm = payload.get('parse_mode')
+                if pm:
+                    modes.append(pm)
+                modes.append(None)  # plain fallback
+                last_exc = None
+                for mode in modes:
+                    try:
+                        result = await self.api.send_message(
+                            dest, text, kb, None, mode, fast=False,
+                        )
+                        if _ok(result):
+                            return True
+                    except BaleAPIError as exc:
+                        last_exc = exc
+                        err = str(exc).lower()
+                        if any(x in err for x in (
+                            'blocked', 'forbidden', 'chat not found', 'have no rights',
+                            'bot was kicked', 'user is deactivated', 'peer_id', 'not found',
+                        )):
+                            return False
+                        # parse errors → try next mode
+                        if 'parse' in err or 'can\'t parse' in err or 'markdown' in err:
+                            continue
+                        # other API errors: don't raise, count as fail
+                        return False
+                    except Exception as exc:
+                        last_exc = exc
+                        return False
                 return False
-            return result is not None
+            if kind == 'photo':
+                result = await self.api.send_photo(dest, payload['file_id'], payload.get('caption'), kb, payload.get('parse_mode'))
+                return _ok(result)
+            if kind == 'video':
+                result = await self.api.send_video(dest, payload['file_id'], payload.get('caption'), kb, payload.get('parse_mode'))
+                return _ok(result)
+            if kind == 'document':
+                result = await self.api.send_document(dest, payload['file_id'], payload.get('caption'), kb, payload.get('parse_mode'))
+                return _ok(result)
+            if kind == 'animation':
+                result = await self.api.send_animation_file_id(dest, payload['file_id'], payload.get('caption'), None, payload.get('parse_mode'))
+                return _ok(result)
+            if kind == 'copy':
+                result = await self.api.copy_message(dest, payload['from_chat_id'], payload['message_id'], kb)
+                return _ok(result)
+            return False
         except BaleAPIError as exc:
             err = str(exc).lower()
-            if any(x in err for x in ('blocked', 'forbidden', 'chat not found', 'have no rights', 'bot was kicked', 'user is deactivated')):
+            if any(x in err for x in (
+                'blocked', 'forbidden', 'chat not found', 'have no rights',
+                'bot was kicked', 'user is deactivated', 'peer_id',
+            )):
                 return False
-            raise
+            log.warning('broadcast dest=%s api: %s', dest, type(exc).__name__)
+            return False
+        except Exception as exc:
+            log.warning('broadcast dest=%s err=%s', dest, type(exc).__name__)
+            return False
 
-    # ─── Learned phrases helpers ────────────────────────────────────────
 
     def _extract_broadcast_payload(self, msg: dict, text: str) -> dict | None:
         """Build a serialisable payload from an admin message for later re-send."""

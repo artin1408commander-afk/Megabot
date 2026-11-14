@@ -206,7 +206,7 @@ def image_to_gif(raw: bytes, text: str = '') -> bytes:
 
 
 def video_to_gif(raw: bytes, suffix: str = '.mp4', text: str = '') -> bytes:
-    """Video → GIF. ffmpeg only for demux/scale; Persian text via Pillow (no drawtext)."""
+    """Video → GIF. Map video stream only (avoid audio colorspace errors). Text via Pillow."""
     if not shutil.which('ffmpeg'):
         raise RuntimeError('ffmpeg روی سرور نصب نیست؛ از Dockerfile همین پروژه برای استقرار استفاده کن.')
     long_source = len(raw) > 3 * 1024 * 1024
@@ -217,54 +217,57 @@ def video_to_gif(raw: bytes, suffix: str = '.mp4', text: str = '') -> bytes:
         src = tmp_path / ('input' + (suffix if suffix.startswith('.') else f'.{suffix}'))
         src.write_bytes(raw)
         frames_dir = tmp_path / 'frames'
-        frames_dir.mkdir()
+        frames_dir.mkdir(exist_ok=True)
 
-        side = GIF_MAX_SIDE
-        fps = GIF_FPS
-        # Simple, widely-supported scale (avoid fragile force_original_aspect_ratio flags)
-        # scale=w:h with -2 keeps aspect and even dimensions for encoder safety
-        vf = f'fps={fps},scale={side}:-2'
-
-        def _run_ffmpeg(vf_expr: str) -> None:
-            # Clear previous frames
+        def extract(vf: str, max_frames: int) -> list[Path]:
             for old in frames_dir.glob('f_*.png'):
                 old.unlink(missing_ok=True)
+            out_pat = str(frames_dir / 'f_%04d.png')
             cmd = [
                 'ffmpeg', '-nostdin', '-hide_banner', '-loglevel', 'error', '-y',
                 '-i', str(src),
+                '-map', '0:v:0',
+                '-an',
                 '-t', str(MAX_VIDEO_SECONDS),
-                '-vf', vf_expr,
-                '-frames:v', str(GIF_MAX_FRAMES),
-                str(frames_dir / 'f_%04d.png'),
+                '-vf', vf,
+                '-pix_fmt', 'rgb24',
+                '-frames:v', str(max_frames),
+                out_pat,
             ]
+            proc = subprocess.run(cmd, capture_output=True, timeout=60)
+            if proc.returncode != 0:
+                err = (proc.stderr or b'').decode('utf-8', 'ignore')[:300]
+                raise RuntimeError(f'ffmpeg failed: {err or proc.returncode}')
+            return sorted(frames_dir.glob('f_*.png'))
+
+        paths: list[Path] = []
+        attempts = [
+            (f'fps={GIF_FPS},scale={GIF_MAX_SIDE}:-2', GIF_MAX_FRAMES),
+            (f'fps=8,scale=480:-2', 40),
+            (f'fps=6,scale=360:-2', 30),
+            ('fps=5,scale=320:-2', 20),
+        ]
+        last_err = None
+        for vf, nfr in attempts:
             try:
-                subprocess.run(cmd, check=True, timeout=60, capture_output=True)
-            except subprocess.CalledProcessError as exc:
-                err = (exc.stderr or b'').decode('utf-8', 'ignore')[:400]
-                raise RuntimeError(f'ffmpeg failed: {err or exc}') from exc
-            except subprocess.TimeoutExpired as exc:
-                raise RuntimeError('ffmpeg timeout — ویدیو خیلی طولانی یا سنگین است.') from exc
-
-        try:
-            _run_ffmpeg(vf)
-        except RuntimeError:
-            # Fallback: lower res / fps
-            _run_ffmpeg(f'fps=6,scale=360:-2')
-
-        paths = sorted(frames_dir.glob('f_*.png'))
+                paths = extract(vf, nfr)
+                if paths:
+                    break
+            except Exception as exc:
+                last_err = exc
+                paths = []
         if not paths:
-            # Last resort: single-frame extract
+            # single still frame
             still = tmp_path / 'still.png'
             cmd = [
                 'ffmpeg', '-nostdin', '-hide_banner', '-loglevel', 'error', '-y',
-                '-i', str(src), '-frames:v', '1', '-q:v', '2', str(still),
+                '-i', str(src), '-map', '0:v:0', '-an', '-frames:v', '1',
+                '-pix_fmt', 'rgb24', str(still),
             ]
-            try:
-                subprocess.run(cmd, check=True, timeout=30, capture_output=True)
-            except Exception as exc:
-                raise RuntimeError(f'استخراج فریم ناموفق: {type(exc).__name__}') from exc
-            if not still.exists():
-                raise RuntimeError('هیچ فریمی از ویدیو استخراج نشد.')
+            proc = subprocess.run(cmd, capture_output=True, timeout=30)
+            if proc.returncode != 0 or not still.exists():
+                err = (proc.stderr or b'').decode('utf-8', 'ignore')[:300]
+                raise RuntimeError(f'ffmpeg failed: {err or last_err}')
             paths = [still]
 
         frames: list[Image.Image] = []
@@ -274,35 +277,27 @@ def video_to_gif(raw: bytes, suffix: str = '.mp4', text: str = '') -> bytes:
                 if text:
                     fr = _overlay(fr, text)
                 frames.append(fr.copy())
-
         if not frames:
-            raise RuntimeError('ساخت فریم گیف ناموفق بود.')
+            raise RuntimeError('هیچ فریمی ساخته نشد.')
 
         frames_q = _quantize_gif_frames(frames)
         out = io.BytesIO()
         frames_q[0].save(
-            out,
-            format='GIF',
-            save_all=True,
+            out, format='GIF', save_all=True,
             append_images=frames_q[1:] if len(frames_q) > 1 else [],
-            loop=0,
-            duration=max(80, int(1000 / max(1, min(fps, 12)))),
-            optimize=True,
+            loop=0, duration=max(90, int(1000 / max(1, GIF_FPS))), optimize=True,
         )
         result = out.getvalue()
 
         if len(result) > limit and len(frames) > 1:
-            # Shrink: fewer frames + smaller side
-            step = max(1, len(frames) // 24)
-            small = []
-            for fr in frames[::step][:24]:
-                fr2 = ImageOps.contain(fr, (360, 360))
-                small.append(fr2.convert('P', palette=Image.ADAPTIVE, colors=96))
+            step = max(1, len(frames) // 20)
+            small = [
+                ImageOps.contain(fr, (320, 320)).convert('P', palette=Image.ADAPTIVE, colors=64)
+                for fr in frames[::step][:20]
+            ]
             out2 = io.BytesIO()
-            small[0].save(
-                out2, format='GIF', save_all=True, append_images=small[1:],
-                loop=0, duration=120, optimize=True,
-            )
+            small[0].save(out2, format='GIF', save_all=True, append_images=small[1:],
+                          loop=0, duration=120, optimize=True)
             result = out2.getvalue()
 
         hard_cap = MAX_OUTPUT_LONG if long_source else MAX_OUTPUT_BYTES

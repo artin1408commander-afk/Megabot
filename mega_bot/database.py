@@ -513,54 +513,37 @@ class Database:
         return [dict(r) for r in rows]
 
     async def stats(self) -> dict:
-        """Public stats — user counts based on private (PV) activity, not groups."""
+        """Public stats — users from users table (all known bot users)."""
         async with self._pool().acquire() as c:
-            # Users who ever interacted in private chat
-            pv_users = await c.fetchval(
-                "SELECT COUNT(DISTINCT user_id) FROM usage_events "
-                "WHERE chat_type = 'private' AND user_id IS NOT NULL"
-            ) or 0
+            users_total = int(await c.fetchval('SELECT COUNT(*) FROM users') or 0)
+            # Also include anyone seen only in usage_events
+            events_users = int(await c.fetchval(
+                'SELECT COUNT(DISTINCT user_id) FROM usage_events WHERE user_id IS NOT NULL'
+            ) or 0)
+            users_total = max(users_total, events_users)
+
+            new_today = int(await c.fetchval(
+                "SELECT COUNT(*) FROM users WHERE first_seen >= date_trunc('day', NOW() AT TIME ZONE 'Asia/Tehran')"
+            ) or 0)
+            new_month = int(await c.fetchval(
+                "SELECT COUNT(*) FROM users WHERE first_seen >= date_trunc('month', NOW() AT TIME ZONE 'Asia/Tehran')"
+            ) or 0)
+            active_month = int(await c.fetchval(
+                "SELECT COUNT(*) FROM users WHERE last_seen >= date_trunc('month', NOW() AT TIME ZONE 'Asia/Tehran')"
+            ) or 0)
+            # PV-specific (optional breakdown)
+            pv_users = int(await c.fetchval(
+                "SELECT COUNT(DISTINCT user_id) FROM usage_events WHERE chat_type = 'private' AND user_id IS NOT NULL"
+            ) or 0)
             if not pv_users:
-                # fallback: all known users (legacy before usage tracking)
-                pv_users = await c.fetchval('SELECT COUNT(*) FROM users') or 0
-            # New PV users this calendar day (first private event today)
-            new_today = await c.fetchval(
-                """
-                SELECT COUNT(*) FROM (
-                  SELECT user_id, MIN(created_at) AS first_pv
-                  FROM usage_events
-                  WHERE chat_type = 'private' AND user_id IS NOT NULL
-                  GROUP BY user_id
-                ) t WHERE first_pv >= date_trunc('day', NOW())
-                """
-            ) or 0
-            # New PV users this calendar month
-            new_month = await c.fetchval(
-                """
-                SELECT COUNT(*) FROM (
-                  SELECT user_id, MIN(created_at) AS first_pv
-                  FROM usage_events
-                  WHERE chat_type = 'private' AND user_id IS NOT NULL
-                  GROUP BY user_id
-                ) t WHERE first_pv >= date_trunc('month', NOW())
-                """
-            ) or 0
-            # Active in PV this month (sent any private event)
-            active_month = await c.fetchval(
-                "SELECT COUNT(DISTINCT user_id) FROM usage_events "
-                "WHERE chat_type = 'private' AND user_id IS NOT NULL "
-                "AND created_at >= date_trunc('month', NOW())"
-            ) or 0
+                pv_users = users_total
+
             return {
-                'users': int(pv_users),
-                'new_today': int(new_today),
-                'new_month': int(new_month),
-                'active_month': int(active_month),
-                'groups': await c.fetchval("SELECT COUNT(*) FROM groups_seen WHERE COALESCE(bot_status, 'member') NOT IN ('left', 'kicked')") or 0,
-                'group_users': await c.fetchval(
-                    "SELECT COUNT(DISTINCT user_id) FROM usage_events "
-                    "WHERE chat_type IN ('group','supergroup') AND user_id IS NOT NULL"
-                ) or 0,
+                'users': users_total,
+                'users_pv': pv_users,
+                'new_today': new_today,
+                'new_month': new_month,
+                'active_month': active_month,
                 'banned_users': await c.fetchval(
                     "SELECT COUNT(*) FROM moderation_cases WHERE target_type='user' "
                     "AND active=TRUE AND (expires_at IS NULL OR expires_at>NOW())"
@@ -572,7 +555,9 @@ class Database:
                 'donations': await c.fetchval(
                     "SELECT COALESCE((value #>> '{}')::bigint,0) FROM settings WHERE key='donations_total'"
                 ) or 0,
-                'groups_registered': await c.fetchval("SELECT COUNT(*) FROM groups_seen WHERE COALESCE(bot_status, 'member') NOT IN ('left', 'kicked')") or 0,
+                'groups_registered': await c.fetchval(
+                    "SELECT COUNT(*) FROM groups_seen WHERE COALESCE(bot_status, 'member') NOT IN ('left', 'kicked')"
+                ) or 0,
             }
 
 

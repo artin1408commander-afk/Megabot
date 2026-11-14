@@ -5081,12 +5081,17 @@ class MegaBot:
                 await self.safe_edit(chat_id, message_id, 'کمپین دیگری در حال اجراست.',
                                      inline([[('↩️ برگشت', 'admin:page:0')]]))
                 return
+            state['progress_chat'] = chat_id
+            state['progress_mid'] = message_id
             self.states.pop(uid, None)
             task = asyncio.create_task(self._run_broadcast(uid, chat_id, state), name=f'bc-{uid}')
             self._bg_tasks.add(task)
             task.add_done_callback(self._bg_tasks.discard)
-            await self.safe_edit(chat_id, message_id, '🚀 ارسال آغاز شد. گزارش در پایان ارسال می‌شود.',
-                                 inline([[('🛑 لغو', 'adm:bc:cancel')]]))
+            await self.safe_edit(
+                chat_id, message_id,
+                '🚀 همگانی شروع شد…\n\n[░░░░░░░░░░░░░░░░░░░░] 0%\n\nموفق: 0 | ناموفق: 0'.replace('\\n', chr(10)),
+                inline([[('🛑 لغو', 'adm:bc:cancel')]]),
+            )
             return
         if data == 'adm:bc:abort':
             self.states.pop(uid, None)
@@ -5094,11 +5099,33 @@ class MegaBot:
                                  inline([[('↩️ برگشت', 'adm:broadcast'), ('✖️ بستن', 'close')]]))
             return
 
+    @staticmethod
+    def _progress_bar(done: int, total: int, width: int = 20) -> str:
+        if total <= 0:
+            filled = width
+            pct = 100
+        else:
+            pct = int(done * 100 / total)
+            filled = int(width * done / total)
+            filled = max(0, min(width, filled))
+        return f"[{'█' * filled}{'░' * (width - filled)}] {pct}%"
+
     async def _run_broadcast(self, admin_uid: int, report_chat: int, state: dict) -> None:
+        """Fast concurrent broadcast with a single editable progress message."""
         self._broadcast_running = True
         self._broadcast_cancel.discard(admin_uid)
         target = state.get('bc_target', 'users')
         payload = state.get('bc_payload') or {}
+        progress_chat = int(state.get('progress_chat') or report_chat)
+        progress_mid = state.get('progress_mid')
+        concurrency = 14
+        # Build ad keyboard once (not per destination)
+        try:
+            if (payload.get('kind') or 'text') != 'animation':
+                payload = dict(payload)
+                payload['_kb'] = await self._with_ad_keyboard(None)
+        except Exception:
+            pass
         try:
             if target == 'users':
                 ids = await self.db.private_user_ids()
@@ -5108,68 +5135,116 @@ class MegaBot:
                 ids = list(dict.fromkeys(
                     (await self.db.private_user_ids()) + (await self.db.group_chat_ids())
                 ))
-            # Exclude the admin and the bot itself
             bot_id = getattr(self, 'bot_id', None)
             ids = [i for i in ids if i != admin_uid and i != bot_id]
             total = len(ids)
             sent = failed = blocked = 0
             kind = payload.get('kind', 'text')
-            for idx, dest in enumerate(ids):
-                if admin_uid in self._broadcast_cancel:
-                    remaining = total - idx
-                    await self.safe_send(
-                        report_chat,
-                        f'🛑 کمپین لغو شد.\n✅ موفق: {sent}\n❌ ناموفق: {failed}\n🚫 مسدود/غیرقابل‌دسترسی: {blocked}\n⏭ باقی‌مانده: {remaining}',
-                        skip_ad=True,
-                    )
+            lock = asyncio.Lock()
+            done = 0
+            last_edit = 0.0
+            cancelled = False
+
+            async def _edit_progress(force: bool = False) -> None:
+                nonlocal last_edit
+                if not progress_mid:
                     return
+                now = time.time()
+                if not force and (now - last_edit) < 1.2:
+                    return
+                last_edit = now
+                bar = self._progress_bar(done, total)
+                body = (
+                    f'🚀 در حال ارسال همگانی…\n'
+                    f'{bar}\n'
+                    f'{done}/{total}\n'
+                    f'✅ موفق: {sent}   ❌ ناموفق: {failed}'
+                )
+                try:
+                    await self.api.edit_message(progress_chat, int(progress_mid), body, None, None)
+                except Exception:
+                    pass
+
+            async def _one(dest: int) -> None:
+                nonlocal sent, failed, blocked, done
+                if admin_uid in self._broadcast_cancel:
+                    return
+                ok = False
                 try:
                     ok = await self._broadcast_one(dest, payload)
+                except Exception as exc:
+                    err = str(exc).lower()
+                    async with lock:
+                        failed += 1
+                        if any(x in err for x in ('blocked', 'forbidden', 'chat not found', 'have no rights', 'kicked')):
+                            blocked += 1
+                    log.warning('broadcast dest=%s err=%s', dest, type(exc).__name__)
+                    async with lock:
+                        done += 1
+                    return
+                async with lock:
                     if ok:
                         sent += 1
                     else:
                         failed += 1
-                except Exception as exc:
-                    failed += 1
-                    err = str(exc).lower()
-                    if 'blocked' in err or 'forbidden' in err or 'chat not found' in err or 'have no rights' in err:
-                        blocked += 1
-                    log.warning('broadcast dest=%s err=%s', dest, type(exc).__name__)
-                # Faster rate; progress every 50
-                if idx % 25 == 24:
-                    await asyncio.sleep(0.3)
-                else:
-                    await asyncio.sleep(0.03)
-                if idx > 0 and idx % 50 == 49:
-                    try:
-                        await self.safe_send(
-                            report_chat,
-                            f'⏳ پیشرفت همگانی: {idx+1}/{total} | موفق {sent} | ناموفق {failed}',
-                            skip_ad=True,
-                            parse_mode=None,
-                        )
-                    except Exception:
-                        pass
-            report = (
-                f'✅ گزارش پیام همگانی\n'
-                f'مخاطبان هدف: {total}\n'
-                f'موفق: {sent}\n'
-                f'ناموفق: {failed}\n'
-                f'مسدود/غیرقابل‌دسترسی: {blocked}\n'
-                f'باقی‌مانده: 0'
-            ).replace('\\n', chr(10))
-            report = chr(10).join([
-                '✅ گزارش پیام همگانی',
-                f'مخاطبان هدف: {total}',
-                f'موفق: {sent}',
-                f'ناموفق: {failed}',
-                f'مسدود/غیرقابل‌دسترسی: {blocked}',
-                'باقی‌مانده: 0',
-            ])
-            await self.safe_send(report_chat, report, skip_ad=True, parse_mode=None)
-            await self.db.log(admin_uid, 'broadcast_done', details={
-                'target': target, 'total': total, 'sent': sent, 'failed': failed, 'blocked': blocked, 'kind': kind,
-            })
+                    done += 1
+
+            await _edit_progress(force=True)
+
+            # Process in concurrent batches so nothing is skipped and rate stays high
+            batch_size = concurrency * 2  # 24 per wave
+            for i in range(0, total, batch_size):
+                if admin_uid in self._broadcast_cancel:
+                    cancelled = True
+                    break
+                chunk = ids[i:i + batch_size]
+                # limit in-flight with semaphore inside gather
+                sem = asyncio.Semaphore(concurrency)
+
+                async def _guarded(d: int):
+                    async with sem:
+                        await _one(d)
+
+                await asyncio.gather(*[_guarded(d) for d in chunk], return_exceptions=True)
+                await _edit_progress(force=True)
+                # tiny pause between waves so API is not hard-throttled
+                await asyncio.sleep(0.05)
+
+            remaining = max(0, total - done)
+            if cancelled:
+                body = (
+                    f'🛑 کمپین لغو شد.\n'
+                    f'{self._progress_bar(done, total)}\n'
+                    f'پردازش‌شده: {done}/{total}\n'
+                    f'✅ موفق: {sent}\n'
+                    f'❌ ناموفق: {failed}\n'
+                    f'🚫 مسدود: {blocked}\n'
+                    f'⏭ باقی‌مانده: {remaining}'
+                )
+            else:
+                body = (
+                    f'✅ گزارش پیام همگانی\n'
+                    f'{self._progress_bar(total, total)}\n'
+                    f'مخاطبان هدف: {total}\n'
+                    f'✅ موفق: {sent}\n'
+                    f'❌ ناموفق: {failed}\n'
+                    f'🚫 مسدود/غیرقابل‌دسترسی: {blocked}\n'
+                    f'باقی‌مانده: 0'
+                )
+            if progress_mid:
+                try:
+                    await self.api.edit_message(progress_chat, int(progress_mid), body, None, None)
+                except Exception:
+                    await self.safe_send(report_chat, body, skip_ad=True, parse_mode=None)
+            else:
+                await self.safe_send(report_chat, body, skip_ad=True, parse_mode=None)
+            try:
+                await self.db.log(admin_uid, 'broadcast_done', details={
+                    'target': target, 'total': total, 'sent': sent, 'failed': failed,
+                    'blocked': blocked, 'kind': kind, 'cancelled': cancelled,
+                })
+            except Exception:
+                pass
         except Exception:
             log.exception('broadcast campaign crashed')
             try:
@@ -5183,8 +5258,8 @@ class MegaBot:
     async def _broadcast_one(self, dest: int, payload: dict) -> bool:
         """Send one broadcast item. Count success only when API returns a message result."""
         kind = payload.get('kind', 'text')
-        kb = None
-        if kind != 'animation':
+        kb = payload.get('_kb')
+        if kb is None and kind != 'animation':
             try:
                 kb = await self._with_ad_keyboard(None)
             except Exception:
@@ -5216,7 +5291,7 @@ class MegaBot:
                 for mode in modes:
                     try:
                         result = await self.api.send_message(
-                            dest, text, kb, None, mode, fast=False,
+                            dest, text, kb, None, mode, fast=True,
                         )
                         if _ok(result):
                             return True

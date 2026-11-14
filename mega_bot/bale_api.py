@@ -547,6 +547,23 @@ class BaleAPI:
             payload['reply_markup'] = self._encode_reply_markup(reply_markup) if isinstance(reply_markup, dict) else reply_markup
         return await self.call('copyMessage', payload, retries=0)
 
+
+    async def get_chat(self, chat_id) -> dict:
+        """Resolve channel/group by id or @username."""
+        return await self.call('getChat', {'chat_id': chat_id})
+
+    async def get_chat_member(self, chat_id, user_id: int) -> dict:
+        return await self.call('getChatMember', {'chat_id': chat_id, 'user_id': int(user_id)})
+
+    async def get_chat_member_status(self, chat_id, user_id: int) -> str | None:
+        try:
+            m = await self.get_chat_member(chat_id, user_id)
+            if isinstance(m, dict):
+                return (m.get('status') or '').lower() or None
+        except Exception:
+            return None
+        return None
+
     async def ban_chat_member(self, chat_id: int, user_id: int, until_date: int | None = None) -> dict:
         payload: dict[str, Any] = {'chat_id': chat_id, 'user_id': user_id}
         if until_date is not None:

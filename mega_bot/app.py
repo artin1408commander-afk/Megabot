@@ -706,6 +706,60 @@ class MegaBot:
             )
             return
 
+
+        # Force-join add flows (owner / group admin)
+        st = self.states.get(uid) or {}
+        if st.get('step') in ('fj_add_global', 'fj_add_group') and text:
+            if text in ('لغو', 'انصراف', '/cancel'):
+                self.states.pop(uid, None)
+                await self.safe_send(chat_id, 'لغو شد.', parse_mode=None)
+                return
+            info, err = await self._resolve_force_join_target(text)
+            if err:
+                await self.safe_send(chat_id, f'❌ {err}', parse_mode=None)
+                return
+            if st['step'] == 'fj_add_global':
+                if uid != OWNER_ID:
+                    self.states.pop(uid, None)
+                    return
+                if await self.db.count_force_joins('global', 0) >= 15:
+                    self.states.pop(uid, None)
+                    await self.safe_send(chat_id, 'سقف ۱۵ مورد پر است.', parse_mode=None)
+                    return
+                await self.db.add_force_join(
+                    scope='global', host_chat_id=0,
+                    target_chat_id=int(info['target_chat_id']),
+                    target_username=info.get('target_username'),
+                    target_title=info.get('target_title') or '',
+                    invite_link=info.get('invite_link'),
+                    added_by=uid,
+                )
+                self.states.pop(uid, None)
+                await self.safe_send(chat_id, f"✅ اضافه شد: {info.get('target_title')}", parse_mode=None)
+                await self._show_owner_force_joins(chat_id)
+                return
+            if st['step'] == 'fj_add_group':
+                host = int(st.get('host_chat_id') or chat_id)
+                if not (await self._is_chat_admin(host, uid) or uid == OWNER_ID):
+                    self.states.pop(uid, None)
+                    return
+                # only one
+                existing = await self.db.list_force_joins('group', host)
+                for ex in existing:
+                    await self.db.remove_force_join(int(ex['id']), scope='group', host_chat_id=host)
+                await self.db.add_force_join(
+                    scope='group', host_chat_id=host,
+                    target_chat_id=int(info['target_chat_id']),
+                    target_username=info.get('target_username'),
+                    target_title=info.get('target_title') or '',
+                    invite_link=info.get('invite_link'),
+                    added_by=uid,
+                )
+                self.states.pop(uid, None)
+                await self.safe_send(chat_id, f"✅ جوین اجباری گروه فعال شد:\n{info.get('target_title')}", parse_mode=None)
+                return
+
+
         # Timed/manual group lock — earliest enforcement (before GIF/commands)
         # /ping above remains available for diagnostics.
         if is_group and uid and uid != OWNER_ID:
@@ -715,6 +769,22 @@ class MegaBot:
                     return
             except Exception:
                 log.exception('time-lock enforce error chat=%s', chat_id)
+
+        # Group-level forced join (one target) — blocks chat until joined
+        if is_group and uid and uid != OWNER_ID:
+            try:
+                if await self._enforce_group_force_join(uid, chat_id, msg):
+                    return
+            except Exception:
+                log.exception('group force-join enforce error chat=%s', chat_id)
+
+        # Global forced joins — gate feature usage
+        if uid and uid != OWNER_ID and text:
+            try:
+                if await self._enforce_global_force_join(uid, chat_id, msg, text):
+                    return
+            except Exception:
+                log.exception('global force-join enforce error')
 
         try:
             is_new_user = await asyncio.wait_for(self.db.upsert_user(user), timeout=3.0)
@@ -1540,6 +1610,97 @@ class MegaBot:
         self, uid: int, chat_id: int, message_id: int, data: str,
         user: dict, chat: dict, query: dict,
     ) -> None:
+        # ── Force join callbacks ──
+        if data == 'own:fj':
+            if uid != OWNER_ID:
+                return
+            await self._show_owner_force_joins(chat_id, message_id)
+            return
+        if data == 'fj:panel':
+            if not (await self._is_chat_admin(chat_id, uid) or uid == OWNER_ID):
+                await self.safe_send(chat_id, '⛔ فقط مدیران گروه.', parse_mode=None)
+                return
+            await self._show_group_force_join_panel(chat_id, message_id)
+            return
+        if data == 'fj:add:g':
+            if uid != OWNER_ID:
+                return
+            n = await self.db.count_force_joins('global', 0)
+            if n >= 15:
+                await self.safe_edit(chat_id, message_id, 'سقف ۱۵ جوین اجباری پر است.', inline([[('↩️ بازگشت', 'own:fj')]]))
+                return
+            self.states[uid] = {'step': 'fj_add_global', 'chat_id': chat_id}
+            await self.safe_edit(
+                chat_id, message_id,
+                'شناسه @کانال یا گروه مقصد را بفرست.\nمثال: `@mychannel` یا `-123456`\nربات باید عضو آنجا باشد.\nلغو: لغو',
+                inline([[('↩️ انصراف', 'own:fj', 'danger')]]),
+            )
+            return
+        if data == 'fj:add:l':
+            if not (await self._is_chat_admin(chat_id, uid) or uid == OWNER_ID):
+                return
+            if await self.db.count_force_joins('group', int(chat_id)) >= 1:
+                await self._show_group_force_join_panel(chat_id, message_id)
+                return
+            self.states[uid] = {'step': 'fj_add_group', 'chat_id': chat_id, 'host_chat_id': chat_id}
+            await self.safe_edit(
+                chat_id, message_id,
+                'گروه/کانال مقصد — آیدی یا @ را بفرست.\nتوجه: ربات باید عضو مقصد باشد.\nلغو: لغو',
+                inline([[('↩️ انصراف', 'fj:panel', 'danger')]]),
+            )
+            return
+        if data.startswith('fj:del:g:'):
+            if uid != OWNER_ID:
+                return
+            jid = int(data.split(':')[-1])
+            await self.db.remove_force_join(jid, scope='global', host_chat_id=0)
+            await self._show_owner_force_joins(chat_id, message_id)
+            return
+        if data.startswith('fj:del:l:'):
+            if not (await self._is_chat_admin(chat_id, uid) or uid == OWNER_ID):
+                return
+            jid = int(data.split(':')[-1])
+            await self.db.remove_force_join(jid, scope='group', host_chat_id=int(chat_id))
+            await self._show_group_force_join_panel(chat_id, message_id)
+            return
+        if data.startswith('fj:v:g:'):
+            # verify global memberships
+            target_uid = int(data.split(':')[-1])
+            if int(uid) != target_uid and uid != OWNER_ID:
+                await self.api.answer_callback(callback_id, 'این دکمه برای تو نیست', show_alert=True)
+                return
+            items = await self.db.list_force_joins('global', 0)
+            missing = await self._missing_force_joins(target_uid, items)
+            if not missing:
+                await self.safe_edit(chat_id, message_id, '✅ تایید شد — عضویت کامل است.', None)
+                await self.api.answer_callback(callback_id, 'تایید شد')
+                return
+            kb = self._force_join_keyboard(missing, verify_cb=f'fj:v:g:{target_uid}')
+            await self.safe_edit(chat_id, message_id, 'ابتدا عضو گروه/کانال های زیر شوید✅️', kb)
+            await self.api.answer_callback(callback_id, 'هنوز عضو نیستی')
+            return
+        if data.startswith('fj:v:l:'):
+            parts = data.split(':')
+            # fj:v:l:{chat}:{uid}
+            try:
+                host = int(parts[3]); target_uid = int(parts[4])
+            except Exception:
+                return
+            if int(uid) != target_uid and uid != OWNER_ID:
+                await self.api.answer_callback(callback_id, 'این دکمه برای تو نیست', show_alert=True)
+                return
+            items = await self.db.list_force_joins('group', host)
+            missing = await self._missing_force_joins(target_uid, items)
+            if not missing:
+                await self.safe_edit(chat_id, message_id, '✅ تایید شد — می‌تونی صحبت کنی.', None)
+                await self.api.answer_callback(callback_id, 'تایید شد')
+                return
+            kb = self._force_join_keyboard(missing, verify_cb=f'fj:v:l:{host}:{target_uid}')
+            await self.safe_edit(chat_id, message_id, 'ابتدا عضو این گروه / کانال شو', kb)
+            await self.api.answer_callback(callback_id, 'هنوز عضو نیستی')
+            return
+
+
         if data == 'close':
             self.states.pop(uid, None)
             await self.safe_edit(
@@ -4468,6 +4629,8 @@ class MegaBot:
                 page = 0
             await self._show_owner_users(chat_id, message_id, page)
             return
+
+
         if data == 'own:settings':
             if not owner:
                 return
@@ -4488,8 +4651,8 @@ class MegaBot:
                 body,
                 inline([
                     [(f'🛠️ تعمیرات: {maint_lbl}', 'own:maint:toggle')],
+                    [('🔗 جوین اجباری', 'own:fj'), ('💚 حمایت مالی', 'own:donations')],
                     [('👨‍💻 تیم توسعه', 'own:team'), ('📝 درباره ما', 'own:about')],
-                    [('💚 حمایت مالی', 'own:donations')],
                     [('↩️ برگشت', 'admin:page:0'), ('✖️ بستن', 'close')],
                 ]),
             )
@@ -7654,6 +7817,230 @@ class MegaBot:
         ])
         await self.safe_edit(chat_id, message_id, text, kb)
 
+
+    # ── Force join (mandatory channel/group membership) ─────────────────
+
+    _MEMBER_OK = frozenset({'creator', 'administrator', 'member', 'restricted'})
+
+    async def _user_in_chat(self, target_chat_id, user_id: int) -> bool:
+        st = await self.api.get_chat_member_status(target_chat_id, user_id)
+        return bool(st and st in self._MEMBER_OK)
+
+    async def _bot_in_chat(self, target_chat_id) -> bool:
+        bot_id = getattr(self, 'bot_id', None)
+        if not bot_id:
+            try:
+                me = await self.api.call('getMe', {})
+                bot_id = int((me or {}).get('id') or 0)
+                self.bot_id = bot_id
+            except Exception:
+                return False
+        st = await self.api.get_chat_member_status(target_chat_id, int(bot_id))
+        return bool(st and st in self._MEMBER_OK)
+
+    def _force_join_button_row(self, item: dict) -> list:
+        """Green button linking to channel/group if possible."""
+        title = (item.get('target_title') or item.get('target_username') or str(item.get('target_chat_id')))[:40]
+        uname = (item.get('target_username') or '').lstrip('@')
+        link = item.get('invite_link') or ''
+        if uname:
+            url = f'https://ble.ir/{uname}'
+        elif link:
+            url = link
+        else:
+            # callback-only fallback (no URL)
+            return [('🟢 ' + title, f'fj:open:{item["id"]}', 'success')]
+        return [{'text': '🟢 ' + title, 'url': url, 'style': 'success'}]
+
+    def _force_join_keyboard(self, missing: list[dict], *, verify_cb: str) -> dict:
+        rows = []
+        for it in missing:
+            row = self._force_join_button_row(it)
+            # normalize to dict buttons for url
+            out = []
+            for cell in row:
+                if isinstance(cell, dict):
+                    out.append(cell)
+                else:
+                    # (label, data, style)
+                    b = {'text': cell[0], 'callback_data': cell[1]}
+                    if len(cell) > 2:
+                        b['style'] = cell[2]
+                    out.append(b)
+            rows.append(out)
+        rows.append([{'text': '✅ تایید عضویت', 'callback_data': verify_cb, 'style': 'success'}])
+        return {'inline_keyboard': rows}
+
+    async def _missing_force_joins(self, user_id: int, items: list[dict]) -> list[dict]:
+        missing = []
+        for it in items:
+            tid = it.get('target_chat_id')
+            try:
+                ok = await self._user_in_chat(tid, user_id)
+            except Exception:
+                ok = False
+            if not ok:
+                missing.append(it)
+        return missing
+
+    async def _enforce_global_force_join(self, uid: int, chat_id: int, msg: dict, text: str) -> bool:
+        """Block bot feature usage until user joined all global force-join targets.
+        Returns True if message was consumed (blocked)."""
+        if not uid or uid == OWNER_ID:
+            return False
+        try:
+            if await self.db.is_admin(uid):
+                return False
+        except Exception:
+            pass
+        # Only gate intentional feature use — not every random group chat
+        is_group = self._is_group_chat(msg.get('chat') or {})
+        if is_group:
+            # In groups global force-join applies to commands / feature triggers
+            if not text:
+                return False
+            feature = (
+                text.startswith('/')
+                or text in (
+                    'دوز', 'بازی دوز', 'شیر یا خط', 'قوانین', 'پین', 'آمار', 'امار',
+                    'جوک', 'فال', 'فونت', 'تایم', 'لول', 'پروفایل', 'تگ', 'قفل',
+                    'خوشامد', 'خداحافظ', 'ریپیت', 'اتو', 'اتوماسیون',
+                )
+                or text.startswith(('اکو ', 'فونت ', 'ریپیت', 'اتو', 'نجوا'))
+            )
+            if not feature:
+                return False
+        try:
+            items = await self.db.list_force_joins('global', 0)
+        except Exception:
+            log.exception('list_force_joins global')
+            return False
+        if not items:
+            return False
+        missing = await self._missing_force_joins(uid, items)
+        if not missing:
+            return False
+        kb = self._force_join_keyboard(missing, verify_cb=f'fj:v:g:{uid}')
+        body = 'ابتدا عضو گروه/کانال های زیر شوید✅️'
+        sent = await self.safe_send(chat_id, body, kb, reply_to=msg.get('message_id'), parse_mode=None)
+        # auto-delete prompt after 40s (global)
+        if sent and isinstance(sent, dict) and sent.get('message_id'):
+            asyncio.create_task(self._delete_later(chat_id, int(sent['message_id']), 40))
+        return True
+
+    async def _enforce_group_force_join(self, uid: int, chat_id: int, msg: dict) -> bool:
+        """Per-group single forced join — blocks regular chat until joined."""
+        if not uid or uid == OWNER_ID:
+            return False
+        try:
+            if await self._is_chat_admin(chat_id, uid):
+                return False
+        except Exception:
+            pass
+        try:
+            items = await self.db.list_force_joins('group', int(chat_id))
+        except Exception:
+            return False
+        if not items:
+            return False
+        missing = await self._missing_force_joins(uid, items)
+        if not missing:
+            return False
+        kb = self._force_join_keyboard(missing, verify_cb=f'fj:v:l:{chat_id}:{uid}')
+        it = missing[0]
+        kind = 'کانال' if (it.get('target_username') or '').startswith('') else 'گروه/کانال'
+        body = f'ابتدا عضو این گروه / کانال شو\n\n🟢 {it.get("target_title") or it.get("target_username") or it.get("target_chat_id")}'
+        sent = await self.safe_send(chat_id, body, kb, reply_to=msg.get('message_id'), parse_mode=None)
+        if sent and isinstance(sent, dict) and sent.get('message_id'):
+            asyncio.create_task(self._delete_later(chat_id, int(sent['message_id']), 30))
+        # try delete user message if bot has rights
+        try:
+            mid = msg.get('message_id')
+            if mid:
+                await self.api.delete_message(chat_id, int(mid))
+        except Exception:
+            pass
+        return True
+
+    async def _delete_later(self, chat_id: int, message_id: int, delay: float) -> None:
+        try:
+            await asyncio.sleep(delay)
+            await self.api.delete_message(chat_id, message_id)
+        except Exception:
+            pass
+
+    async def _resolve_force_join_target(self, raw: str) -> tuple[dict | None, str]:
+        """Parse @username or numeric id → chat info. Returns (info, error)."""
+        s = (raw or '').strip()
+        if not s:
+            return None, 'شناسه خالی است.'
+        if s.startswith('https://ble.ir/'):
+            s = '@' + s.rstrip('/').split('/')[-1]
+        if s.startswith('ble.ir/'):
+            s = '@' + s.split('/')[-1]
+        key = s if s.startswith('@') or s.lstrip('-').isdigit() else ('@' + s)
+        try:
+            chat = await self.api.get_chat(key if key.startswith('@') else int(key))
+        except Exception as exc:
+            return None, f'چت پیدا نشد یا ربات به آن دسترسی ندارد: {type(exc).__name__}'
+        if not isinstance(chat, dict) or not chat.get('id'):
+            return None, 'پاسخ نامعتبر از API.'
+        cid = int(chat['id'])
+        # bot must be member
+        if not await self._bot_in_chat(cid):
+            return None, 'ربات باید اول عضو آن گروه/کانال باشد (و ترجیحاً ادمین).'
+        uname = chat.get('username')
+        title = chat.get('title') or chat.get('first_name') or (('@' + uname) if uname else str(cid))
+        link = f'https://ble.ir/{uname}' if uname else None
+        return {
+            'target_chat_id': cid,
+            'target_username': uname,
+            'target_title': title,
+            'invite_link': link,
+            'type': chat.get('type'),
+        }, ''
+
+    async def _show_owner_force_joins(self, chat_id: int, message_id: int | None = None) -> None:
+        items = await self.db.list_force_joins('global', 0)
+        lines = [f'*جوین اجباری سراسری* ({len(items)}/15)', '']
+        if not items:
+            lines.append('هنوز موردی ثبت نشده.')
+        rows = []
+        for it in items:
+            label = it.get('target_title') or it.get('target_username') or str(it['target_chat_id'])
+            un = ('@' + it['target_username']) if it.get('target_username') else str(it['target_chat_id'])
+            lines.append(f"• {label} (`{un}`)")
+            rows.append([(f'🗑️ حذف {label[:20]}', f'fj:del:g:{it["id"]}', 'danger')])
+        if len(items) < 15:
+            rows.append([('➕ افزودن کانال/گروه', 'fj:add:g', 'success')])
+        rows.append([('↩️ بازگشت', 'own:settings', 'danger'), ('✖️ بستن', 'close', 'danger')])
+        body = '\n'.join(lines)
+        kb = inline(rows)
+        if message_id:
+            await self.safe_edit(chat_id, message_id, body, kb)
+        else:
+            await self.safe_send(chat_id, body, kb)
+
+    async def _show_group_force_join_panel(self, chat_id: int, message_id: int | None = None) -> None:
+        items = await self.db.list_force_joins('group', int(chat_id))
+        lines = ['*جوین اجباری این گروه*', 'فقط ۱ کانال/گروه مقصد مجاز است.', '']
+        rows = []
+        if items:
+            it = items[0]
+            label = it.get('target_title') or it.get('target_username') or str(it['target_chat_id'])
+            lines.append(f'✅ فعال: {label}')
+            rows.append([(f'🗑️ حذف جوین اجباری', f'fj:del:l:{it["id"]}', 'danger')])
+        else:
+            lines.append('فعلاً خاموش است.')
+            rows.append([('➕ تنظیم کانال/گروه مقصد', 'fj:add:l', 'success')])
+        rows.append([('🔙 بازگشت به قفل‌ها', 'lock:panel', 'danger')])
+        body = '\n'.join(lines)
+        kb = inline(rows)
+        if message_id:
+            await self.safe_edit(chat_id, message_id, body, kb)
+        else:
+            await self.safe_send(chat_id, body, kb)
+
     async def _show_locks_panel(self, chat_id: int, message_id: int | None = None, header: str | None = None) -> None:
         gs = await self.db.get_group_settings(chat_id)
         mod = gs.get('moderation') or {}
@@ -7713,6 +8100,7 @@ class MegaBot:
             [('🤐 سکوت', 'lock:ptype:mute'), ('👢 اخراج', 'lock:ptype:kick')],
             [('⛔ مسدود', 'lock:ptype:ban'), ('⚠️ فقط اخطار', 'lock:ptype:warn_only')],
             [('۱۰د', 'lock:pdur:600'), ('۳۰د', 'lock:pdur:1800'), ('۱س', 'lock:pdur:3600'), ('۲۴س', 'lock:pdur:86400')],
+            [('🔗 جوین اجباری گروه', 'fj:panel')],
             [(f'{auto} مجازات خودکار', 'lock:toggle_auto'), (f'{reset} صفر اخطار', 'lock:toggle_reset')],
             [('🔙 بازگشت به قفل‌ها', 'lock:panel'), ('✖️ بستن', 'close')],
         ])

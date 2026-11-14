@@ -8,9 +8,9 @@ MAX_VIDEO_SECONDS = 20
 # Target: most GIFs well under 5MB; long clips may approach this ceiling.
 MAX_OUTPUT_BYTES = 5 * 1024 * 1024
 MAX_OUTPUT_LONG = 8 * 1024 * 1024  # only for longer source videos
-GIF_MAX_SIDE = 480
-GIF_FPS = 8
-GIF_MAX_FRAMES = 48
+GIF_MAX_SIDE = 560
+GIF_FPS = 10
+GIF_MAX_FRAMES = 60
 
 # Same family as stats dashboard (Vazirmatn Bold) — never reverse with bidi.
 _FONT_DIR = Path(__file__).resolve().parent / 'assets' / 'fonts'
@@ -90,7 +90,7 @@ def _overlay(image: Image.Image, text: str) -> Image.Image:
     draw = ImageDraw.Draw(image)
     margin = max(6, int(min(image.width, image.height) * 0.04))
     max_width = max(20, image.width - 2 * margin)
-    max_height = max(20, int(image.height * 0.42))  # text block may use up to ~42% of height
+    max_height = max(20, int(image.height * 0.36))  # text block may use up to ~42% of height
 
     # ~5% larger than previous baseline, bold Vazirmatn
     size = max(18, int(image.height * 0.168))
@@ -127,7 +127,7 @@ def _overlay(image: Image.Image, text: str) -> Image.Image:
         block_h = sum(line_heights) + gap * max(0, len(lines) - 1)
 
     # Vertical position ~75% down, clamp fully inside frame
-    y = int(image.height * 0.72) - block_h // 2
+    y = int(image.height * 0.86) - block_h // 2
     y = max(margin, min(image.height - block_h - margin, y))
 
     # Pure white + strong black outline for contrast (reads “whiter / bolder”)
@@ -151,7 +151,7 @@ def _quantize_gif_frames(frames: list[Image.Image]) -> list[Image.Image]:
     """Reduce palette for smaller GIF size."""
     out = []
     for fr in frames:
-        q = fr.convert('P', palette=Image.ADAPTIVE, colors=128)
+        q = fr.convert('P', palette=Image.ADAPTIVE, colors=192)
         out.append(q)
     return out
 

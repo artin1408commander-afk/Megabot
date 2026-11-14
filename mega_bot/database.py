@@ -340,6 +340,20 @@ CREATE TABLE IF NOT EXISTS group_auto_messages (
 CREATE INDEX IF NOT EXISTS group_auto_messages_chat_idx
   ON group_auto_messages (chat_id, enabled);
 
+
+CREATE TABLE IF NOT EXISTS force_joins (
+  id BIGSERIAL PRIMARY KEY,
+  scope TEXT NOT NULL CHECK (scope IN ('global','group')),
+  host_chat_id BIGINT NOT NULL DEFAULT 0,
+  target_chat_id BIGINT NOT NULL,
+  target_username TEXT,
+  target_title TEXT NOT NULL DEFAULT '',
+  invite_link TEXT,
+  added_by BIGINT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (scope, host_chat_id, target_chat_id)
+);
+CREATE INDEX IF NOT EXISTS force_joins_scope_idx ON force_joins (scope, host_chat_id);
 """
 
 class Database:
@@ -2361,4 +2375,64 @@ class Database:
                      AND COALESCE(g.bot_status, 'member') NOT IN ('left', 'kicked')""",
                 int(user_id),
             ) or 0)
+
+    async def list_force_joins(self, scope: str = 'global', host_chat_id: int = 0) -> list[dict]:
+        async with self._pool().acquire() as c:
+            rows = await c.fetch(
+                """SELECT id, scope, host_chat_id, target_chat_id, target_username,
+                          target_title, invite_link, added_by, created_at
+                   FROM force_joins
+                   WHERE scope=$1 AND host_chat_id=$2
+                   ORDER BY id ASC""",
+                scope, int(host_chat_id),
+            )
+        return [dict(r) for r in rows]
+
+    async def count_force_joins(self, scope: str = 'global', host_chat_id: int = 0) -> int:
+        async with self._pool().acquire() as c:
+            return int(await c.fetchval(
+                'SELECT COUNT(*) FROM force_joins WHERE scope=$1 AND host_chat_id=$2',
+                scope, int(host_chat_id),
+            ) or 0)
+
+    async def add_force_join(self, *, scope: str, host_chat_id: int, target_chat_id: int,
+                             target_username: str | None, target_title: str,
+                             invite_link: str | None, added_by: int | None) -> dict:
+        async with self._pool().acquire() as c:
+            existing = await c.fetchrow(
+                'SELECT id FROM force_joins WHERE scope=$1 AND host_chat_id=$2 AND target_chat_id=$3',
+                scope, int(host_chat_id), int(target_chat_id),
+            )
+            if existing:
+                await c.execute(
+                    """UPDATE force_joins SET target_username=$2, target_title=$3,
+                           invite_link=COALESCE($4, invite_link), added_by=$5
+                       WHERE id=$1""",
+                    int(existing['id']), target_username, target_title or '', invite_link, added_by,
+                )
+                row = await c.fetchrow('SELECT * FROM force_joins WHERE id=$1', int(existing['id']))
+            else:
+                row = await c.fetchrow(
+                    """INSERT INTO force_joins(scope, host_chat_id, target_chat_id, target_username, target_title, invite_link, added_by)
+                       VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING *""",
+                    scope, int(host_chat_id), int(target_chat_id),
+                    target_username, target_title or '', invite_link, added_by,
+                )
+        return dict(row)
+
+    async def remove_force_join(self, join_id: int, *, scope: str | None = None, host_chat_id: int | None = None) -> bool:
+        async with self._pool().acquire() as c:
+            if scope is not None and host_chat_id is not None:
+                r = await c.execute(
+                    'DELETE FROM force_joins WHERE id=$1 AND scope=$2 AND host_chat_id=$3',
+                    int(join_id), scope, int(host_chat_id),
+                )
+            else:
+                r = await c.execute('DELETE FROM force_joins WHERE id=$1', int(join_id))
+        return 'DELETE' in str(r) and not str(r).endswith(' 0')
+
+    async def get_force_join(self, join_id: int) -> dict | None:
+        async with self._pool().acquire() as c:
+            row = await c.fetchrow('SELECT * FROM force_joins WHERE id=$1', int(join_id))
+        return dict(row) if row else None
 

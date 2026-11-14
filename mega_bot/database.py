@@ -314,6 +314,19 @@ CREATE TABLE IF NOT EXISTS joke_usage (
   last_used_at TIMESTAMPTZ
 );
 
+CREATE TABLE IF NOT EXISTS mention_watch_logs (
+  id BIGSERIAL PRIMARY KEY,
+  user_id BIGINT NOT NULL,
+  chat_id BIGINT NOT NULL,
+  message_id BIGINT,
+  message_text TEXT NOT NULL,
+  matched_terms TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS mention_watch_user_idx ON mention_watch_logs (user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS mention_watch_chat_idx ON mention_watch_logs (chat_id, created_at DESC);
+
+
 CREATE TABLE IF NOT EXISTS group_auto_messages (
   id BIGSERIAL PRIMARY KEY,
   chat_id BIGINT NOT NULL,
@@ -361,6 +374,17 @@ class Database:
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 )''')
             await conn.execute('CREATE INDEX IF NOT EXISTS group_auto_messages_chat_idx ON group_auto_messages (chat_id, enabled)')
+            await conn.execute("""CREATE TABLE IF NOT EXISTS mention_watch_logs (
+  id BIGSERIAL PRIMARY KEY,
+  user_id BIGINT NOT NULL,
+  chat_id BIGINT NOT NULL,
+  message_id BIGINT,
+  message_text TEXT NOT NULL,
+  matched_terms TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+)""")
+            await conn.execute('CREATE INDEX IF NOT EXISTS mention_watch_user_idx ON mention_watch_logs (user_id, created_at DESC)')
+
             await conn.execute("ALTER TABLE groups_seen ADD COLUMN IF NOT EXISTS bot_status TEXT NOT NULL DEFAULT 'member'")
             await conn.execute("INSERT INTO settings(key,value) VALUES('about', to_jsonb($1::text)) ON CONFLICT(key) DO NOTHING", "MEGA BOT یک ربات اجتماعی برای بله است.")
             await conn.execute("INSERT INTO settings(key,value) VALUES('donations_total', '0'::jsonb) ON CONFLICT(key) DO NOTHING")
@@ -383,33 +407,48 @@ class Database:
             raise RuntimeError('Database is not connected')
         return self.pool
 
-    async def upsert_user(self, user: dict[str, Any]) -> None:
+    async def upsert_user(self, user: dict[str, Any]) -> bool:
+        """Insert/update user. Returns True if this was the first time the user was seen."""
         uid = user.get('id')
         if not uid:
-            return
+            return False
         async with self._pool().acquire() as c:
-            await c.execute("""INSERT INTO users(user_id,username,first_name) VALUES($1,$2,$3)
-              ON CONFLICT(user_id) DO UPDATE SET username=EXCLUDED.username, first_name=EXCLUDED.first_name, last_seen=NOW()""",
-              int(uid), user.get('username'), user.get('first_name') or user.get('name') or '')
+            row = await c.fetchrow(
+                """INSERT INTO users(user_id,username,first_name) VALUES($1,$2,$3)
+                   ON CONFLICT(user_id) DO UPDATE SET
+                     username=EXCLUDED.username,
+                     first_name=EXCLUDED.first_name,
+                     last_seen=NOW()
+                   RETURNING (xmax = 0) AS inserted""",
+                int(uid),
+                user.get('username'),
+                user.get('first_name') or user.get('name') or '',
+            )
+        return bool(row and row.get('inserted'))
 
-    async def upsert_group(self, chat: dict[str, Any], bot_status: str | None = 'member') -> None:
+
+    async def upsert_group(self, chat: dict[str, Any], bot_status: str | None = 'member') -> bool:
+        """Insert/update group. Returns True if newly registered."""
         cid = chat.get('id')
         if not cid:
-            return
+            return False
         st = (bot_status or 'member').lower().strip() or 'member'
         async with self._pool().acquire() as c:
-            await c.execute(
+            row = await c.fetchrow(
                 """INSERT INTO groups_seen(chat_id,title,username,bot_status) VALUES($1,$2,$3,$4)
-              ON CONFLICT(chat_id) DO UPDATE SET
-                title=EXCLUDED.title,
-                username=EXCLUDED.username,
-                last_seen=NOW(),
-                bot_status=EXCLUDED.bot_status""",
+                   ON CONFLICT(chat_id) DO UPDATE SET
+                     title=EXCLUDED.title,
+                     username=EXCLUDED.username,
+                     last_seen=NOW(),
+                     bot_status=EXCLUDED.bot_status
+                   RETURNING (xmax = 0) AS inserted""",
                 int(cid),
                 chat.get('title') or chat.get('name') or '',
                 chat.get('username'),
                 st,
             )
+        return bool(row and row.get('inserted'))
+
 
     async def get_setting(self, key: str, default: Any = None) -> Any:
         async with self._pool().acquire() as c:
@@ -829,6 +868,7 @@ class Database:
         'antidoc': False, 'anticontact': False,
         'antiforward': False, 'antimention': False, 'antipoll': False, 'antilong': False,
         'joinrestrict': False,
+        'interaction': False,
     }
 
     DEFAULT_MODERATION = {
@@ -2258,4 +2298,67 @@ class Database:
             except Exception:
                 rows = await c.fetch('SELECT chat_id FROM groups_seen ORDER BY chat_id')
         return [int(r['chat_id']) for r in rows]
+
+    async def log_mention_watch(
+        self,
+        user_id: int,
+        chat_id: int,
+        message_text: str,
+        matched_terms: str,
+        message_id: int | None = None,
+    ) -> None:
+        async with self._pool().acquire() as c:
+            await c.execute(
+                """INSERT INTO mention_watch_logs(user_id, chat_id, message_id, message_text, matched_terms)
+                   VALUES($1,$2,$3,$4,$5)""",
+                int(user_id), int(chat_id), message_id, (message_text or '')[:2000], matched_terms[:200],
+            )
+
+    async def list_mention_watch(
+        self, user_id: int, limit: int = 5, offset: int = 0,
+    ) -> list[dict]:
+        async with self._pool().acquire() as c:
+            rows = await c.fetch(
+                """SELECT m.id, m.user_id, m.chat_id, m.message_id, m.message_text, m.matched_terms, m.created_at,
+                          g.title AS group_title, g.username AS group_username
+                   FROM mention_watch_logs m
+                   LEFT JOIN groups_seen g ON g.chat_id = m.chat_id
+                   WHERE m.user_id=$1
+                   ORDER BY m.created_at DESC
+                   LIMIT $2 OFFSET $3""",
+                int(user_id), int(limit), int(offset),
+            )
+        return [dict(r) for r in rows]
+
+    async def count_mention_watch(self, user_id: int) -> int:
+        async with self._pool().acquire() as c:
+            return int(await c.fetchval(
+                'SELECT COUNT(*) FROM mention_watch_logs WHERE user_id=$1', int(user_id),
+            ) or 0)
+
+    async def list_user_shared_groups(self, user_id: int, limit: int = 20, offset: int = 0) -> list[dict]:
+        """Groups where user has activity and bot is still a member."""
+        async with self._pool().acquire() as c:
+            rows = await c.fetch(
+                """SELECT a.chat_id, a.msg_count, a.xp, a.level, a.last_active_at,
+                          g.title, g.username, g.bot_status
+                   FROM user_group_activity a
+                   JOIN groups_seen g ON g.chat_id = a.chat_id
+                   WHERE a.user_id=$1
+                     AND COALESCE(g.bot_status, 'member') NOT IN ('left', 'kicked')
+                   ORDER BY a.last_active_at DESC NULLS LAST
+                   LIMIT $2 OFFSET $3""",
+                int(user_id), int(limit), int(offset),
+            )
+        return [dict(r) for r in rows]
+
+    async def count_user_shared_groups(self, user_id: int) -> int:
+        async with self._pool().acquire() as c:
+            return int(await c.fetchval(
+                """SELECT COUNT(*) FROM user_group_activity a
+                   JOIN groups_seen g ON g.chat_id = a.chat_id
+                   WHERE a.user_id=$1
+                     AND COALESCE(g.bot_status, 'member') NOT IN ('left', 'kicked')""",
+                int(user_id),
+            ) or 0)
 

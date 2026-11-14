@@ -8,7 +8,7 @@ from .bale_api import BaleAPI, BaleAPIError
 from .database import Database
 from .media_tools import convert_media, MAX_INPUT_BYTES
 from .messaging import MessageHub
-from .keyboards import USER_KEYBOARD, inline, menu_page, main_admin_menu, user_actions, url_button, merge_inline
+from .keyboards import USER_KEYBOARD, inline, menu_page, main_admin_menu, user_actions, url_button, merge_inline, STYLE_SUCCESS, STYLE_DANGER, STYLE_PRIMARY
 from . import prices as price_mod
 from . import fun_content
 from .profanity import contains_profanity, extract_urls, text_similarity, collapse_for_match
@@ -712,7 +712,12 @@ class MegaBot:
                 log.exception('time-lock enforce error chat=%s', chat_id)
 
         try:
-            await asyncio.wait_for(self.db.upsert_user(user), timeout=3.0)
+            is_new_user = await asyncio.wait_for(self.db.upsert_user(user), timeout=3.0)
+            if is_new_user:
+                try:
+                    asyncio.create_task(self._notify_owner_new_user(user))
+                except Exception:
+                    pass
         except Exception:
             log.warning('upsert_user skipped/failed for %s', uid)
 
@@ -788,7 +793,12 @@ class MegaBot:
 
         if self._is_group_chat(chat):
             try:
-                await asyncio.wait_for(self.db.upsert_group(chat, bot_status='member'), timeout=2.0)
+                is_new_group = await asyncio.wait_for(self.db.upsert_group(chat, bot_status='member'), timeout=2.0)
+                if is_new_group:
+                    try:
+                        asyncio.create_task(self._notify_owner_new_group(chat))
+                    except Exception:
+                        pass
             except Exception:
                 log.warning('upsert_group skipped for %s', chat_id)
         try:
@@ -800,6 +810,12 @@ class MegaBot:
         if is_group and uid:
             try:
                 await self.db.record_group_message(chat_id, uid, msg)
+            except Exception:
+                pass
+
+            try:
+                if text:
+                    await self._maybe_log_watch_mention(chat_id, uid, text, msg)
             except Exception:
                 pass
 
@@ -1389,6 +1405,17 @@ class MegaBot:
         except Exception:
             log.warning('learned lookup failed chat=%s', chat_id)
 
+        # Interaction (emoji reactions + social auto-replies): OFF by default; group lock "interaction"
+        interaction_on = True
+        if is_group:
+            try:
+                gs = await self.db.get_group_settings(chat_id)
+                interaction_on = bool((gs.get('security') or {}).get('interaction', False))
+            except Exception:
+                interaction_on = False
+        if not interaction_on and is_group:
+            return
+
         # Emoji-only: single emoji reply, no text. Rate-limited per user.
         if self._is_emoji_only(text):
             last = self._emoji_last.get(uid, 0)
@@ -1783,7 +1810,7 @@ class MegaBot:
                 await self.safe_send(chat_id, '⛔ دسترسی پنل ادمین نداری.')
             return
 
-        if data.startswith('adm:target:'):
+        if data.startswith('adm:uhist:') or data.startswith('adm:ugroups:') or data.startswith('adm:uwarn:') or data.startswith('adm:uwarnlv:') or data.startswith('adm:target:'):
             await self.handle_target_select(uid, chat_id, message_id, data)
             return
 
@@ -2045,7 +2072,12 @@ class MegaBot:
                 for k in [k for k in list(self._admin_cache.keys()) if k[0] == chat_id]:
                     self._admin_cache.pop(k, None)
                 try:
-                    await asyncio.wait_for(self.db.upsert_group(chat, bot_status=status), timeout=3.0)
+                    is_new_group = await asyncio.wait_for(self.db.upsert_group(chat, bot_status=status), timeout=3.0)
+                    if is_new_group and status in ('member', 'administrator', 'creator'):
+                        try:
+                            asyncio.create_task(self._notify_owner_new_group(chat))
+                        except Exception:
+                            pass
                 except Exception:
                     log.warning('upsert_group on my_chat_member skipped for %s', chat_id)
         except Exception:
@@ -2191,6 +2223,93 @@ class MegaBot:
         t = re.sub(r'(.)\1{2,}', r'\1\1', t)  # سلامممم → سلامم
         t = re.sub(r'\s+', ' ', t).strip()
         return t
+
+
+    # Brand / owner watchlist for admin history (normalized collapsed forms)
+    _WATCH_TERMS = (
+        'آرتین', 'ارتین', 'گلستانی', 'مگابات', 'مگا', 'بگا', 'بگابات',
+        'دارکنایت', 'دارک نایت', 'دارک‌نایت', 'darkknight', 'megabot', 'mega bot',
+        'artin', 'golestani',
+    )
+
+    def _match_watch_terms(self, text: str) -> list[str]:
+        if not text:
+            return []
+        try:
+            from .anti_abuse import collapse_text, soft_tokens
+            hard = collapse_text(text)
+            soft = soft_tokens(text)
+        except Exception:
+            hard = (text or '').replace(' ', '').lower()
+            soft = (text or '').lower()
+        hits = []
+        for term in self._WATCH_TERMS:
+            try:
+                from .anti_abuse import collapse_text
+                key = collapse_text(term)
+            except Exception:
+                key = term.replace(' ', '').lower()
+            if key and (key in hard or term.lower() in soft):
+                hits.append(term)
+        # Insults aimed at watched names (simple proximity)
+        try:
+            from .profanity import contains_profanity
+            if hits and contains_profanity(text):
+                hits.append('فحش‌مرتبط')
+        except Exception:
+            pass
+        return list(dict.fromkeys(hits))
+
+    async def _notify_owner_new_user(self, user: dict) -> None:
+        try:
+            uid = int(user.get('id') or 0)
+            if not uid or not OWNER_ID:
+                return
+            name = (user.get('first_name') or user.get('name') or 'کاربر').strip() or 'کاربر'
+            uname = (user.get('username') or '').strip()
+            at = f'@{uname}' if uname else '—'
+            await self.safe_send(
+                int(OWNER_ID),
+                f'🎉 *تبریک! یک کاربر جدید*\n\n'
+                f'👤 نام: {name}\n'
+                f'🔢 شناسه عددی: `{uid}`\n'
+                f'🆔 آیدی: {at}',
+                permanent=True,
+            )
+        except Exception:
+            log.debug('owner new-user notify failed', exc_info=True)
+
+    async def _notify_owner_new_group(self, chat: dict) -> None:
+        try:
+            cid = int(chat.get('id') or 0)
+            if not cid or not OWNER_ID:
+                return
+            title = (chat.get('title') or chat.get('name') or 'گروه').strip() or 'گروه'
+            uname = (chat.get('username') or '').strip()
+            at = f'@{uname}' if uname else '—'
+            await self.safe_send(
+                int(OWNER_ID),
+                f'🎉 *تبریک! یک گروه دیگر اضافه شد*\n\n'
+                f'👥 نام: {title}\n'
+                f'🔢 شناسه گروه: `{cid}`\n'
+                f'🆔 آیدی گروه: {at}',
+                permanent=True,
+            )
+        except Exception:
+            log.debug('owner new-group notify failed', exc_info=True)
+
+    async def _maybe_log_watch_mention(self, chat_id: int, uid: int, text: str, msg: dict) -> None:
+        if not uid or not text or not self._is_group_chat({'id': chat_id}) and False:
+            pass
+        hits = self._match_watch_terms(text)
+        if not hits:
+            return
+        try:
+            await self.db.log_mention_watch(
+                uid, chat_id, text, ','.join(hits), msg.get('message_id'),
+            )
+        except Exception:
+            log.debug('mention watch log failed', exc_info=True)
 
     def social_reply(self, text: str, stats: dict) -> str | None:
         low = self._normalize_social(text)
@@ -4179,6 +4298,11 @@ class MegaBot:
         if data == 'adm:stats':
             if not await self.has_perm(uid,'stats'): return await self.safe_send(chat_id,'⛔ مجوز مشاهده آمار نداری.')
             await self.safe_edit(chat_id,message_id,self.stats_text(await self.db.stats()),inline([[('↩️ برگشت','admin:page:0'),('✖️ بستن','close')]])); return
+        
+        if data.startswith('adm:uhist:') or data.startswith('adm:ugroups:') or data.startswith('adm:uwarn:') or data.startswith('adm:uwarnlv:') or data.startswith('adm:uwarngo:'):
+            await self.handle_user_search_extra(uid, chat_id, message_id, data)
+            return
+
         if data in ('adm:search:user','adm:search:group'):
             if not await self.has_perm(uid,'search'): return await self.safe_send(chat_id,'⛔ مجوز جست‌وجو نداری.')
             target_type = data.rsplit(':',1)[1]
@@ -4367,6 +4491,202 @@ class MegaBot:
         await self.db.log(uid,'admin_permission_changed','user',target,{'permission':key,'enabled':perms[key]})
         # Refresh the first permissions screen.
         await self.handle_admin_callback(uid,chat_id,message_id,f'own:admin:{target}')
+
+
+    async def handle_user_search_extra(self, uid: int, chat_id: int, message_id: int, data: str) -> None:
+        """Groups in common, mention history, and owner/admin warn wizard for a searched user."""
+        if uid != OWNER_ID and not await self.db.is_admin(uid):
+            await self.safe_send(chat_id, '⛔ دسترسی مدیریت نداری.')
+            return
+        if not await self.has_perm(uid, 'search') and uid != OWNER_ID:
+            await self.safe_send(chat_id, '⛔ مجوز جست‌وجو نداری.')
+            return
+        parts = data.split(':')
+        kind = parts[1] if len(parts) > 1 else ''
+
+        if kind == 'uwarngo':
+            try:
+                target_id = int(parts[2])
+            except Exception:
+                return
+            st = self.states.get(uid) or {}
+            if st.get('step') != 'owner_warn_confirm' or int(st.get('target_id') or 0) != target_id:
+                await self.safe_edit(chat_id, message_id, '❌ نشست اخطار منقضی شده؛ دوباره از سرچ شروع کن.', None)
+                return
+            level = int(st.get('warn_level') or 1)
+            label = st.get('warn_label') or 'اخطار'
+            body = st.get('warn_body') or ''
+            self.states.pop(uid, None)
+            ok, _ = await self._finish_owner_warn_send(uid, target_id, level, label, body)
+            await self.safe_edit(
+                chat_id, message_id,
+                ('✅ اخطار برای کاربر ارسال شد.' if ok else '❌ ارسال اخطار ناموفق بود (کاربر پیوی را استارت نکرده یا بلاک کرده).'),
+                inline([
+                    [('↩️ بازگشت', f'adm:target:user:{target_id}', STYLE_DANGER),
+                     ('✖️ بستن', 'close', STYLE_DANGER)],
+                ]),
+            )
+            return
+
+        if kind == 'uhist':
+            # adm:uhist:USER:PAGE
+            try:
+                target_id = int(parts[2])
+                page = int(parts[3]) if len(parts) > 3 else 0
+            except Exception:
+                await self.safe_edit(chat_id, message_id, '❌ داده نامعتبر.', None)
+                return
+            page = max(0, page)
+            per = 5
+            total = await self.db.count_mention_watch(target_id)
+            rows = await self.db.list_mention_watch(target_id, limit=per, offset=page * per)
+            total_pages = max(1, (total + per - 1) // per)
+            if not rows and page == 0:
+                text = f'📜 *سوابق کاربر* `{target_id}`\n\nموردی ثبت نشده.'
+                kb = inline([
+                    [('↩️ بازگشت', f'adm:target:user:{target_id}', STYLE_DANGER),
+                     ('✖️ بستن', 'close', STYLE_DANGER)],
+                ])
+                await self.safe_edit(chat_id, message_id, text, kb)
+                return
+            lines = [f'📜 *سوابق کاربر* `{target_id}` — صفحه {page+1}/{total_pages} (کل {total})\n']
+            for r in rows:
+                body = (r.get('message_text') or '')[:180].replace('`', "'")
+                gname = r.get('group_username')
+                gat = f'@{gname}' if gname else '—'
+                gid = r.get('chat_id')
+                lines.append(
+                    f'پیام: {body}\n'
+                    f'آیدی گروه: {gat}\n'
+                    f'شناسه عددی گروه: `{gid}`\n'
+                    f'━━━━━━━━━━━━'
+                )
+            text = '\n'.join(lines)
+            nav = []
+            if page > 0:
+                nav.append(('⬅️ قبلی', f'adm:uhist:{target_id}:{page-1}'))
+            if page + 1 < total_pages:
+                nav.append(('بعدی ➡️', f'adm:uhist:{target_id}:{page+1}'))
+            jump = []
+            for jp in (2, 5, 10):
+                if jp - 1 < total_pages and jp - 1 != page:
+                    jump.append((f'صفحه {jp}', f'adm:uhist:{target_id}:{jp-1}'))
+            if total_pages > 1 and page != total_pages - 1:
+                jump.append(('آخر', f'adm:uhist:{target_id}:{total_pages-1}'))
+            kb_rows = []
+            if nav:
+                kb_rows.append(nav)
+            if jump:
+                kb_rows.append(jump[:4])
+            kb_rows.append([
+                ('↩️ بازگشت', f'adm:target:user:{target_id}', STYLE_DANGER),
+                ('✖️ بستن', 'close', STYLE_DANGER),
+            ])
+            await self.safe_edit(chat_id, message_id, text, inline(kb_rows))
+            return
+
+        if kind == 'ugroups':
+            try:
+                target_id = int(parts[2])
+                page = int(parts[3]) if len(parts) > 3 else 0
+            except Exception:
+                await self.safe_edit(chat_id, message_id, '❌ داده نامعتبر.', None)
+                return
+            page = max(0, page)
+            per = 8
+            total = await self.db.count_user_shared_groups(target_id)
+            rows = await self.db.list_user_shared_groups(target_id, limit=per, offset=page * per)
+            total_pages = max(1, (total + per - 1) // per)
+            lines = [f'👥 *گروه‌های مشترک* `{target_id}` — {page+1}/{total_pages} (کل {total})\n']
+            if not rows:
+                lines.append('گروه مشترکی یافت نشد (فقط گروه‌هایی که کاربر در آن‌ها فعالیت داشته و ربات عضو است).')
+            for r in rows:
+                title = (r.get('title') or 'گروه').strip() or 'گروه'
+                un = r.get('username')
+                at = f'@{un}' if un else '—'
+                lines.append(
+                    f'• {title}\n  آیدی: {at}\n  شناسه: `{r.get("chat_id")}` | پیام≈{r.get("msg_count") or 0}'
+                )
+            nav = []
+            if page > 0:
+                nav.append(('⬅️ قبلی', f'adm:ugroups:{target_id}:{page-1}'))
+            if page + 1 < total_pages:
+                nav.append(('بعدی ➡️', f'adm:ugroups:{target_id}:{page+1}'))
+            kb_rows = []
+            if nav:
+                kb_rows.append(nav)
+            kb_rows.append([
+                ('↩️ بازگشت', f'adm:target:user:{target_id}', STYLE_DANGER),
+                ('✖️ بستن', 'close', STYLE_DANGER),
+            ])
+            await self.safe_edit(chat_id, message_id, '\n'.join(lines), inline(kb_rows))
+            return
+
+        if kind == 'uwarn':
+            # start wizard: choose level
+            try:
+                target_id = int(parts[2])
+            except Exception:
+                return
+            text = (
+                f'⚠️ *اخطار به کاربر* `{target_id}`\n\n'
+                f'سطح اخطار را انتخاب کن:'
+            )
+            kb = inline([
+                [('اخطار ۱/۳', f'adm:uwarnlv:{target_id}:1', STYLE_DANGER),
+                 ('اخطار ۲/۳', f'adm:uwarnlv:{target_id}:2', STYLE_DANGER),
+                 ('اخطار ۳/۳', f'adm:uwarnlv:{target_id}:3', STYLE_DANGER)],
+                [('❌ انصراف', f'adm:target:user:{target_id}', STYLE_DANGER)],
+            ])
+            await self.safe_edit(chat_id, message_id, text, kb)
+            return
+
+        if kind == 'uwarnlv':
+            try:
+                target_id = int(parts[2])
+                level = int(parts[3])
+            except Exception:
+                return
+            level = max(1, min(3, level))
+            self.states[uid] = {
+                'step': 'owner_warn_label',
+                'target_id': target_id,
+                'warn_level': level,
+                'chat_id': chat_id,
+                'message_id': message_id,
+            }
+            await self.safe_edit(
+                chat_id, message_id,
+                f'📝 *توضیحات / لیبل اخطار* ({level}/۳)\n\n'
+                f'یک عنوان کوتاه بفرست؛ مثال: `رفتار نامناسب`\n'
+                f'یا /cancel برای انصراف.',
+                inline([[('❌ انصراف', f'adm:target:user:{target_id}', STYLE_DANGER)]]),
+            )
+            return
+
+    async def _finish_owner_warn_send(self, admin_uid: int, target_id: int, level: int, label: str, body: str) -> None:
+        n = max(1, min(3, int(level)))
+        msg = (
+            f'شما از طرف تیم مدیریت اخطار {n}/۳ گرفتید!\n'
+            f'({label})\n\n'
+            f'{body}\n\n'
+            f'@megabalebot\n'
+            f'@darkknight_studio'
+        )
+        try:
+            await self.safe_send(int(target_id), msg, parse_mode=None, permanent=True)
+            ok = True
+        except Exception as exc:
+            log.warning('owner warn DM failed target=%s: %s', target_id, type(exc).__name__)
+            ok = False
+        try:
+            await self.db.log(
+                admin_uid, 'owner_warn', 'user', target_id,
+                {'level': n, 'label': label, 'ok': ok},
+            )
+        except Exception:
+            pass
+        return ok, msg
 
     async def handle_target_select(self, uid: int, chat_id: int, message_id: int, data: str) -> None:
         if uid != OWNER_ID and not await self.db.is_admin(uid):
@@ -5478,6 +5798,7 @@ class MegaBot:
         ('antiprofane', '🤬 ضد فحش'),
         ('anticontact', '👤 قفل مخاطب'),
         ('joinrestrict', '🚷 محدودیت عضویت'),
+        ('interaction', '💬 تعامل (ریپلای/واکنش)'),
     ]
 
 
@@ -6633,12 +6954,12 @@ class MegaBot:
         gs = await self.db.get_group_settings(chat_id)
         sec = gs.get('security') or {}
         rows = []
-        # pair buttons two-per-row where possible
         pair: list = []
         for key, title in self.LOCK_LABELS:
             on = bool(sec.get(key))
             mark = '🟢' if on else '🔴'
-            pair.append((f'{mark} {title}', f'lock:tog:{key}'))
+            style = STYLE_SUCCESS if on else STYLE_DANGER
+            pair.append((f'{mark} {title}', f'lock:tog:{key}', style))
             if len(pair) == 2:
                 rows.append(pair)
                 pair = []
@@ -6658,9 +6979,9 @@ class MegaBot:
         ])
         rows.append([
             ('🔄 تازه‌سازی', 'lock:refresh'),
-            ('🔙 بازگشت', 'grp:panel'),
+            ('🔙 بازگشت', 'grp:panel', STYLE_DANGER),
         ])
-        rows.append([('✖️ بستن', 'close')])
+        rows.append([('✖️ بستن', 'close', STYLE_DANGER)])
         return inline(rows)
 
     async def _show_welcome_panel(self, chat_id: int, message_id: int | None = None) -> None:
@@ -7515,6 +7836,59 @@ class MegaBot:
                 skip_ad=True,
             )
             return True
+        
+        if step == 'owner_warn_label':
+            if text in ('/cancel', 'لغو', 'انصراف', 'cancel'):
+                self.states.pop(uid, None)
+                await self.safe_send(chat_id, '❌ اخطار لغو شد.', parse_mode=None)
+                return True
+            label = (text or '').strip()[:80]
+            if not label:
+                await self.safe_send(chat_id, 'لیبل خالی است؛ دوباره بفرست.')
+                return True
+            st = dict(state)
+            st['step'] = 'owner_warn_body'
+            st['warn_label'] = label
+            self.states[uid] = st
+            await self.safe_send(
+                chat_id,
+                '📄 *متن کامل اخطار* را بفرست.\nاین متن برای کاربر ارسال می‌شود.\n/cancel برای انصراف.',
+                inline([[('❌ انصراف', f"adm:target:user:{st.get('target_id')}", STYLE_DANGER)]]),
+            )
+            return True
+
+        if step == 'owner_warn_body':
+            if text in ('/cancel', 'لغو', 'انصراف', 'cancel'):
+                self.states.pop(uid, None)
+                await self.safe_send(chat_id, '❌ اخطار لغو شد.', parse_mode=None)
+                return True
+            body = (text or '').strip()[:1500]
+            if not body:
+                await self.safe_send(chat_id, 'متن خالی است؛ دوباره بفرست.')
+                return True
+            st = dict(state)
+            st['step'] = 'owner_warn_confirm'
+            st['warn_body'] = body
+            self.states[uid] = st
+            level = int(st.get('warn_level') or 1)
+            label = st.get('warn_label') or 'اخطار'
+            target_id = int(st.get('target_id'))
+            preview = (
+                f'پیش‌نمایش اخطار برای `{target_id}`:\n\n'
+                f'شما از طرف تیم مدیریت اخطار {level}/۳ گرفتید!\n'
+                f'({label})\n\n{body}\n\n@megabalebot\n@darkknight_studio'
+            )
+            await self.safe_send(
+                chat_id,
+                preview,
+                inline([
+                    [('✅ ارسال', f'adm:uwarngo:{target_id}', STYLE_SUCCESS),
+                     ('❌ انصراف', f'adm:target:user:{target_id}', STYLE_DANGER)],
+                ]),
+                parse_mode=None,
+            )
+            return True
+
         if step == 'search':
             results=await self.db.search_target(text,state['target_type'])
             if not results:

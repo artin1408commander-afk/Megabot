@@ -11,9 +11,59 @@ USER_KEYBOARD = {
     'is_persistent': True,
 }
 
+# Telegram Bot API style values (also accepted by Bale when supported):
+#   primary | success | danger
+STYLE_SUCCESS = 'success'  # green
+STYLE_DANGER = 'danger'    # red
+STYLE_PRIMARY = 'primary'  # blue
 
-def inline(rows: list[list[tuple[str, str]]]) -> dict:
-    return {'inline_keyboard': [[{'text': label, 'callback_data': data} for label, data in row] for row in rows]}
+
+def _btn(label: str, data: str, style: str | None = None) -> dict:
+    b: dict = {'text': label, 'callback_data': str(data)}
+    if style:
+        b['style'] = style
+    return b
+
+
+def inline(rows: list) -> dict:
+    """Build inline keyboard.
+
+    Each cell may be:
+      (label, callback_data)
+      (label, callback_data, style)   # style: success|danger|primary
+      dict already shaped for the API
+    """
+    keyboard = []
+    for row in rows:
+        out = []
+        for item in row:
+            if isinstance(item, dict) and 'text' in item:
+                out.append(item)
+            elif isinstance(item, (list, tuple)):
+                if len(item) >= 3:
+                    label, data, style = item[0], item[1], item[2]
+                    if isinstance(data, str) and data.startswith('http'):
+                        b = {'text': label, 'url': data}
+                    else:
+                        b = _btn(label, data, style)
+                    out.append(b)
+                elif len(item) >= 2:
+                    label, data = item[0], item[1]
+                    if isinstance(data, str) and data.startswith('http'):
+                        out.append({'text': label, 'url': data})
+                    else:
+                        # auto color for common cancel/confirm labels
+                        style = None
+                        low = str(label)
+                        if any(x in low for x in ('لغو', 'انصراف', 'بستن', 'بازگشت', 'برگشت', '❌', '✖️', '🚫')):
+                            style = STYLE_DANGER
+                        elif any(x in low for x in ('تأیید', 'تایید', '✅', 'ذخیره', 'بله', 'ارسال')):
+                            style = STYLE_SUCCESS
+                        out.append(_btn(label, data, style))
+            # else skip malformed
+        if out:
+            keyboard.append(out)
+    return {'inline_keyboard': keyboard}
 
 
 def url_button(label: str, url: str) -> dict:
@@ -35,19 +85,21 @@ def menu_page(items: list[tuple[str, str]], page: int, prefix: str, back: str = 
     start = page * page_size
     shown = items[start:start + page_size]
     rows = [[(label, data)] for label, data in shown]
-    controls: list[tuple[str, str]] = []
+    controls: list = []
     if page > 0:
         controls.append(('⬅️ قبلی', f'{prefix}:page:{page-1}'))
     if start + page_size < len(items):
         controls.append(('بعدی ➡️', f'{prefix}:page:{page+1}'))
     if controls:
         rows.append(controls[:2])
-    rows.append([('↩️ بازگشت', f'{prefix}:back:{back}'), ('✖️ بستن', 'close')])
+    rows.append([
+        ('↩️ بازگشت', f'{prefix}:back:{back}', STYLE_DANGER),
+        ('✖️ بستن', 'close', STYLE_DANGER),
+    ])
     return inline(rows)
 
 
 def main_admin_menu(owner: bool = False) -> dict:
-    # Callbacks unchanged (adm:/own:); labels only.
     items = [
         ('📈 گزارش عملکرد', 'adm:stats'),
         ('🔎 یافتن کاربر', 'adm:search:user'),
@@ -68,7 +120,16 @@ def main_admin_menu(owner: bool = False) -> dict:
 def user_actions(target_type: str, target_id: int, can_ban: bool) -> dict:
     rows = []
     if can_ban:
-        rows.append([('⛔ اعمال محدودیت', f'mod:ban:{target_type}:{target_id}')])
-    rows.append([('♻️ برداشتن محدودیت', f'mod:unban:{target_type}:{target_id}')])
-    rows.append([('↩️ بازگشت', f'adm:search:{target_type}'), ('✖️ بستن', 'close')])
+        rows.append([('⛔ اعمال محدودیت', f'mod:ban:{target_type}:{target_id}', STYLE_DANGER)])
+    rows.append([('♻️ برداشتن محدودیت', f'mod:unban:{target_type}:{target_id}', STYLE_SUCCESS)])
+    if target_type == 'user':
+        rows.append([
+            ('👥 گروه‌های مشترک', f'adm:ugroups:{target_id}:0'),
+            ('📜 سوابق', f'adm:uhist:{target_id}:0'),
+        ])
+        rows.append([('⚠️ اخطار به کاربر', f'adm:uwarn:{target_id}', STYLE_DANGER)])
+    rows.append([
+        ('↩️ بازگشت', f'adm:search:{target_type}', STYLE_DANGER),
+        ('✖️ بستن', 'close', STYLE_DANGER),
+    ])
     return inline(rows)

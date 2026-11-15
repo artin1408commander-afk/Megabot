@@ -3952,8 +3952,9 @@ class MegaBot:
                 '',
                 '➖➖➖➖➖➖➖➖➖➖➖➖',
             ]
+                        # Plain caption (Markdown often breaks photo captions on Bale)
             body = '\n'.join(lines) + role_line
-            # Prefer real profile photo when getUserProfilePhotos works
+            body_plain = body.replace('*', '').replace('`', '')
             photo_sent = False
             try:
                 res = await self.api.get_user_profile_photos(uid, limit=1)
@@ -3975,14 +3976,29 @@ class MegaBot:
                             best = area
                             file_id = s.get('file_id')
                 if file_id:
-                    await self.api.send_photo(
-                        chat_id, file_id, body, None, 'Markdown', msg.get('message_id'),
-                    )
-                    photo_sent = True
+                    # 1) try file_id send
+                    try:
+                        await self.api.send_photo(
+                            chat_id, file_id, body_plain, None, None, msg.get('message_id'),
+                        )
+                        photo_sent = True
+                    except Exception as e1:
+                        log.debug('send_photo file_id failed: %s', type(e1).__name__)
+                        # 2) download bytes and re-upload
+                        try:
+                            raw, _name = await self.api.get_file_bytes(file_id, 5 * 1024 * 1024)
+                            if raw:
+                                await self.api.send_photo_bytes(
+                                    chat_id, raw, 'profile.jpg', body_plain,
+                                    None, None, msg.get('message_id'),
+                                )
+                                photo_sent = True
+                        except Exception as e2:
+                            log.debug('send_photo_bytes failed: %s', type(e2).__name__)
             except Exception as exc:
-                log.debug('profile photo send failed: %s', type(exc).__name__)
+                log.debug('profile photo path failed: %s', type(exc).__name__)
             if not photo_sent:
-                await self.safe_send(chat_id, body, reply_to=msg.get('message_id'))
+                await self.safe_send(chat_id, body, reply_to=msg.get('message_id'), parse_mode=None)
             return
 
         # mode == level
@@ -5344,36 +5360,37 @@ class MegaBot:
         try:
             if kind == 'text':
                 text = payload.get('text') or ''
-                modes = []
-                pm = payload.get('parse_mode')
-                if pm:
-                    modes.append(pm)
-                modes.append(None)  # plain fallback
-                last_exc = None
-                for mode in modes:
+                # Split very long texts so platform char limits never drop content
+                chunks = []
+                max_len = 3500
+                if len(text) <= max_len:
+                    chunks = [text]
+                else:
+                    rest = text
+                    while rest:
+                        chunks.append(rest[:max_len])
+                        rest = rest[max_len:]
+                any_ok = False
+                for part in chunks:
                     try:
                         result = await self.api.send_message(
-                            dest, text, kb, None, mode, fast=True,
+                            dest, part, kb if part is chunks[-1] else None, None, None, fast=True,
                         )
                         if _ok(result):
-                            return True
+                            any_ok = True
+                        else:
+                            return False
                     except BaleAPIError as exc:
-                        last_exc = exc
                         err = str(exc).lower()
                         if any(x in err for x in (
                             'blocked', 'forbidden', 'chat not found', 'have no rights',
                             'bot was kicked', 'user is deactivated', 'peer_id', 'not found',
                         )):
                             return False
-                        # parse errors → try next mode
-                        if 'parse' in err or 'can\'t parse' in err or 'markdown' in err:
-                            continue
-                        # other API errors: don't raise, count as fail
                         return False
-                    except Exception as exc:
-                        last_exc = exc
+                    except Exception:
                         return False
-                return False
+                return any_ok
             if kind == 'photo':
                 result = await self.api.send_photo(dest, payload['file_id'], payload.get('caption'), kb, payload.get('parse_mode'))
                 return _ok(result)
@@ -7247,7 +7264,8 @@ class MegaBot:
             return
         if data.startswith('grp:sectog:') or data.startswith('lock:tog:'):
             key = data.rsplit(':', 1)[-1]
-            if key not in self.db.DEFAULT_SECURITY:
+            known = set(self.db.DEFAULT_SECURITY) | {k for k, _ in self.LOCK_LABELS}
+            if key not in known:
                 await self.safe_send(chat_id, '❌ قفل نامعتبر.', parse_mode=None)
                 return
             new_state = await self.db.toggle_security(chat_id, key)
@@ -8657,15 +8675,32 @@ class MegaBot:
                 'bc_target': target,
                 'bc_payload': payload,
             }
-            await self.safe_send(
-                chat_id,
-                f'*پیش‌نمایش پیام همگانی*\nهدف: {label}\nتعداد تقریبی مخاطبان: `{count}`\nنوع: `{payload.get("kind")}`\nمحتوا:\n{preview_text[:500]}',
-                inline([
-                    [('✅ تأیید ارسال', 'adm:bc:confirm')],
-                    [('✖️ لغو', 'adm:bc:abort'), ('↩️ برگشت', 'adm:broadcast')],
-                ]),
-                skip_ad=True,
+            header = (
+                'پیش‌نمایش پیام همگانی' + chr(10)
+                + f'هدف: {label}' + chr(10)
+                + f'تعداد تقریبی مخاطبان: {count}' + chr(10)
+                + f'نوع: {payload.get("kind")}' + chr(10)
+                + f'طول محتوا: {len(preview_text)} کاراکتر' + chr(10)
+                + '────────' + chr(10)
             )
+            kb = inline([
+                [('✅ تأیید ارسال', 'adm:bc:confirm')],
+                [('✖️ لغو', 'adm:bc:abort'), ('↩️ برگشت', 'adm:broadcast')],
+            ])
+            max_chunk = 3500
+            full = header + (preview_text or '')
+            if len(full) <= max_chunk:
+                await self.safe_send(chat_id, full, kb, skip_ad=True, parse_mode=None, permanent=True)
+            else:
+                await self.safe_send(chat_id, full[:max_chunk], skip_ad=True, parse_mode=None, permanent=True)
+                rest = full[max_chunk:]
+                while rest:
+                    chunk, rest = rest[:max_chunk], rest[max_chunk:]
+                    await self.safe_send(
+                        chat_id, chunk,
+                        kb if not rest else None,
+                        skip_ad=True, parse_mode=None, permanent=True,
+                    )
             return True
         
         if step == 'owner_warn_label':

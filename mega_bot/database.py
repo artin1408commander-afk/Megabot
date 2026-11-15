@@ -868,6 +868,9 @@ class Database:
         'antiforward': False, 'antimention': False, 'antipoll': False, 'antilong': False,
         'joinrestrict': False,
         'interaction': False,
+        # Profile name/bio locks
+        'name_link': False, 'name_profane': False, 'name_addomain': False, 'name_adid': False,
+        'bio_link': False, 'bio_profane': False, 'bio_addomain': False, 'bio_adid': False,
     }
 
     DEFAULT_MODERATION = {
@@ -983,9 +986,13 @@ class Database:
 
     async def toggle_security(self, chat_id: int, key: str) -> bool:
         gs = await self.get_group_settings(chat_id)
-        sec = dict(gs.get('security') or self.DEFAULT_SECURITY)
-        if key not in self.DEFAULT_SECURITY:
+        sec = dict(self.DEFAULT_SECURITY)
+        sec.update(gs.get('security') or {})
+        if key not in self.DEFAULT_SECURITY and key not in sec:
             return False
+        # Ensure known keys always exist so toggles work after upgrades
+        if key not in sec:
+            sec[key] = False
         sec[key] = not bool(sec.get(key))
         await self.set_group_setting_fields(chat_id, security=sec)
         return bool(sec[key])

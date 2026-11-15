@@ -457,7 +457,8 @@ class BaleAPI:
             form.add_field('reply_markup', json.dumps(self._normalize_reply_markup(reply_markup) if isinstance(reply_markup, dict) else reply_markup, ensure_ascii=False))
         if reply_to is not None:
             form.add_field('reply_to_message_id', str(int(reply_to)))
-        form.add_field('photo', data, filename=filename, content_type='image/png')
+        ctype = 'image/jpeg' if str(filename).lower().endswith(('.jpg', '.jpeg')) else 'image/png'
+        form.add_field('photo', data, filename=filename, content_type=ctype)
         async with session.post(
             self.base + 'sendPhoto',
             data=form,

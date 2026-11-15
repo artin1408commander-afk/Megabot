@@ -453,17 +453,32 @@ class MegaBot:
                 force_text=True, permanent=permanent,
             )
 
-    async def safe_edit(self, chat_id: int, message_id: int, text: str, keyboard: dict | None = None) -> None:
+    async def safe_edit(
+        self,
+        chat_id: int,
+        message_id: int,
+        text: str,
+        keyboard: dict | None = None,
+        parse_mode: str | None = 'Markdown',
+        **_kwargs,
+    ) -> None:
         try:
             if keyboard and isinstance(keyboard, dict) and 'inline_keyboard' in keyboard:
                 keyboard = paint_keyboard(keyboard)
         except Exception:
             pass
         try:
-            await self.api.edit_message(chat_id, message_id, text, keyboard)
+            # Prefer API that accepts parse_mode when available
+            try:
+                await self.api.edit_message(chat_id, message_id, text, keyboard, parse_mode)
+            except TypeError:
+                await self.api.edit_message(chat_id, message_id, text, keyboard)
         except Exception as exc:
             log.warning('editMessageText failed: %s', exc)
-            await self.safe_send(chat_id, text, keyboard)
+            try:
+                await self.safe_send(chat_id, text, keyboard, parse_mode=parse_mode)
+            except TypeError:
+                await self.safe_send(chat_id, text, keyboard)
 
     async def run(self, poll_timeout: int = 25) -> None:
         await self._startup_checks()

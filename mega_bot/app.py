@@ -1134,6 +1134,11 @@ class MegaBot:
             else:
                 await self.safe_send(chat_id, f'پیام تست به گروه `{gid}` ارسال نشد؛ دسترسی ارسال پیام ربات در گروه را چک کن.', parse_mode=None)
             return
+        # Targeted one-group broadcast from PV (or anywhere for owner/admin)
+        if text.startswith('همگانی'):
+            if await self._handle_targeted_broadcast_cmd(chat_id, uid, text, msg):
+                return
+
         # If an admin/user is in a multi-step flow, consume their next text before menu shortcuts.
         state = self.states.get(uid)
         if state and int(state.get('chat_id', chat_id)) == chat_id:
@@ -5196,6 +5201,129 @@ class MegaBot:
             return
 
     # ─── Broadcast system ───────────────────────────────────────────────
+
+
+    async def _resolve_group_ref(self, ref: str) -> tuple[int | None, str, str | None]:
+        """Resolve @username / numeric id to a group chat_id. Returns (id, label, error)."""
+        ref = (ref or '').strip()
+        if not ref:
+            return None, '', 'گروه مشخص نیست.'
+        # numeric
+        if ref.lstrip('-').isdigit():
+            gid = int(ref)
+            title = str(gid)
+            try:
+                info = await self.api.get_chat(gid)
+                if isinstance(info, dict):
+                    title = (info.get('title') or info.get('username') or title)
+            except Exception:
+                pass
+            return gid, title, None
+        uname = ref.lstrip('@').strip()
+        if not uname:
+            return None, '', 'یوزرنیم گروه نامعتبر است.'
+        # DB lookup first
+        try:
+            rows = await self.db.search_target(uname, 'group')
+            for r in rows:
+                if (r.get('username') or '').lower() == uname.lower() or str(r.get('id')):
+                    if (r.get('username') or '').lower() == uname.lower():
+                        return int(r['id']), (r.get('name') or uname), None
+            if rows:
+                r = rows[0]
+                return int(r['id']), (r.get('name') or uname), None
+        except Exception:
+            pass
+        # Live getChat by @username
+        try:
+            info = await self.api.get_chat('@' + uname)
+            if isinstance(info, dict) and info.get('id'):
+                return int(info['id']), (info.get('title') or uname), None
+        except Exception as exc:
+            return None, '', f'گروه پیدا نشد: {type(exc).__name__}'
+        return None, '', 'گروه پیدا نشد. ربات باید عضو آن گروه باشد و قبلاً آن را دیده باشد.'
+
+    async def _handle_targeted_broadcast_cmd(self, chat_id: int, uid: int, text: str, msg: dict) -> bool:
+        """PV/group owner command: همگانی @group text  |  همگانی -100123 text"""
+        raw = (text or '').strip()
+        if not raw.startswith('همگانی'):
+            return False
+        # Permission: owner or admin with settings
+        if uid != OWNER_ID:
+            try:
+                if not await self.has_perm(uid, 'settings'):
+                    await self.safe_send(chat_id, '⛔ فقط مالک یا ادمین با مجوز تنظیمات.', parse_mode=None)
+                    return True
+            except Exception:
+                await self.safe_send(chat_id, '⛔ دسترسی کافی نیست.', parse_mode=None)
+                return True
+        rest = raw[len('همگانی'):].strip()
+        if not rest:
+            await self.safe_send(
+                chat_id,
+                chr(10).join([
+                    '📨 ارسال همگانی به یک گروه',
+                    '',
+                    'فرمت:',
+                    'همگانی @یوزرنیم_گروه متن پیام',
+                    'همگانی -100123456 متن پیام',
+                    '',
+                    'مثال:',
+                    'همگانی @test سلام به همه',
+                ]),
+                parse_mode=None,
+                permanent=True,
+            )
+            return True
+        # First token = group ref, rest = message body
+        parts = rest.split(None, 1)
+        gref = parts[0]
+        body = parts[1].strip() if len(parts) > 1 else ''
+        # If replied message provides body
+        replied = msg.get('reply_to_message') or {}
+        if not body and replied:
+            body = (replied.get('text') or replied.get('caption') or '').strip()
+        if not body:
+            await self.safe_send(chat_id, '❌ متن پیام خالی است. بعد از آیدی گروه متن را بنویس.', parse_mode=None)
+            return True
+        gid, label, err = await self._resolve_group_ref(gref)
+        if err or not gid:
+            await self.safe_send(chat_id, f'❌ {err or "گروه پیدا نشد."}', parse_mode=None)
+            return True
+        try:
+            result = await self.api.send_message(gid, body, None, None, None, fast=False)
+            ok = bool(result and (result.get('message_id') or (isinstance(result.get('result'), dict) and result['result'].get('message_id'))))
+        except Exception as exc:
+            log.warning('targeted broadcast failed gid=%s: %s', gid, type(exc).__name__)
+            await self.safe_send(
+                chat_id,
+                chr(10).join([
+                    '❌ ارسال به گروه ناموفق بود.',
+                    f'گروه: {label}',
+                    f'شناسه: {gid}',
+                    f'علت: {type(exc).__name__}',
+                    'مطمئن شو ربات در گروه عضو است و اجازه ارسال پیام دارد.',
+                ]),
+                parse_mode=None,
+            )
+            return True
+        if ok:
+            await self.safe_send(
+                chat_id,
+                chr(10).join([
+                    '✅ همگانی ارسال شد.',
+                    f'گروه: {label}',
+                    f'شناسه: `{gid}`',
+                ]),
+                parse_mode=None,
+            )
+            try:
+                await self.db.log(uid, 'targeted_broadcast', 'group', gid, {'preview': body[:120]})
+            except Exception:
+                pass
+        else:
+            await self.safe_send(chat_id, '❌ ارسال انجام نشد (پاسخ خالی از API).', parse_mode=None)
+        return True
 
     async def _handle_broadcast_callback(self, uid: int, chat_id: int, message_id: int, data: str) -> None:
         if uid != OWNER_ID and not await self.has_perm(uid, 'settings'):

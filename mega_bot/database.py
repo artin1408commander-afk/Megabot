@@ -10,6 +10,21 @@ CREATE TABLE IF NOT EXISTS users (
   starts_count INTEGER NOT NULL DEFAULT 1
 );
 CREATE INDEX IF NOT EXISTS users_username_idx ON users (LOWER(username));
+CREATE TABLE IF NOT EXISTS user_private_first (
+  user_id BIGINT PRIMARY KEY,
+  first_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE TABLE IF NOT EXISTS mention_watch_logs (
+  id BIGSERIAL PRIMARY KEY,
+  user_id BIGINT NOT NULL,
+  chat_id BIGINT NOT NULL DEFAULT 0,
+  message_id BIGINT,
+  message_text TEXT NOT NULL DEFAULT '',
+  matched_terms TEXT NOT NULL DEFAULT '',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS mention_watch_user_idx ON mention_watch_logs (user_id, created_at DESC);
+
 CREATE TABLE IF NOT EXISTS groups_seen (
   chat_id BIGINT PRIMARY KEY, title TEXT NOT NULL DEFAULT '', username TEXT,
   first_seen TIMESTAMPTZ NOT NULL DEFAULT NOW(), last_seen TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -314,17 +329,6 @@ CREATE TABLE IF NOT EXISTS joke_usage (
   last_used_at TIMESTAMPTZ
 );
 
-CREATE TABLE IF NOT EXISTS mention_watch_logs (
-  id BIGSERIAL PRIMARY KEY,
-  user_id BIGINT NOT NULL,
-  chat_id BIGINT NOT NULL,
-  message_id BIGINT,
-  message_text TEXT NOT NULL,
-  matched_terms TEXT,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-CREATE INDEX IF NOT EXISTS mention_watch_user_idx ON mention_watch_logs (user_id, created_at DESC);
-CREATE INDEX IF NOT EXISTS mention_watch_chat_idx ON mention_watch_logs (chat_id, created_at DESC);
 
 
 CREATE TABLE IF NOT EXISTS group_auto_messages (
@@ -400,6 +404,10 @@ class Database:
             await conn.execute('CREATE INDEX IF NOT EXISTS mention_watch_user_idx ON mention_watch_logs (user_id, created_at DESC)')
 
             await conn.execute("ALTER TABLE groups_seen ADD COLUMN IF NOT EXISTS bot_status TEXT NOT NULL DEFAULT 'member'")
+            await conn.execute("""CREATE TABLE IF NOT EXISTS user_private_first (
+  user_id BIGINT PRIMARY KEY,
+  first_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+)""")
             await conn.execute("INSERT INTO settings(key,value) VALUES('about', to_jsonb($1::text)) ON CONFLICT(key) DO NOTHING", "MEGA BOT یک ربات اجتماعی برای بله است.")
             await conn.execute("INSERT INTO settings(key,value) VALUES('donations_total', '0'::jsonb) ON CONFLICT(key) DO NOTHING")
             defaults = {
@@ -420,6 +428,30 @@ class Database:
         if not self.pool:
             raise RuntimeError('Database is not connected')
         return self.pool
+
+
+    async def reset_known_users(self) -> int:
+        """Forget all known users so they re-register on next contact.
+        Does NOT touch moderation_cases (bans), admins, donations, or group settings.
+        """
+        async with self._pool().acquire() as c:
+            n = await c.fetchval('SELECT COUNT(*) FROM users')
+            await c.execute('DELETE FROM user_private_first')
+            await c.execute('DELETE FROM users')
+        return int(n or 0)
+
+    async def claim_first_private(self, user_id: int) -> bool:
+        """True only the first time this user talks in private with the bot."""
+        if not user_id:
+            return False
+        async with self._pool().acquire() as c:
+            row = await c.fetchrow(
+                """INSERT INTO user_private_first(user_id) VALUES($1)
+                   ON CONFLICT (user_id) DO NOTHING
+                   RETURNING user_id""",
+                int(user_id),
+            )
+        return bool(row)
 
     async def upsert_user(self, user: dict[str, Any]) -> bool:
         """Insert/update user. Returns True if this was the first time the user was seen."""
@@ -497,19 +529,52 @@ class Database:
         return [dict(r) for r in rows]
 
     async def search_target(self, term: str, target_type: str) -> list[dict]:
+        term = (term or '').strip()
         async with self._pool().acquire() as c:
             if target_type == 'user':
                 if term.lstrip('-').isdigit():
-                    rows = await c.fetch('SELECT user_id AS id, username, first_name AS name FROM users WHERE user_id=$1 LIMIT 10', int(term))
+                    uid = int(term)
+                    rows = await c.fetch(
+                        'SELECT user_id AS id, username, first_name AS name FROM users WHERE user_id=$1 LIMIT 10',
+                        uid,
+                    )
+                    if not rows:
+                        # fallback: seen in group activity only
+                        rows = await c.fetch(
+                            """SELECT DISTINCT a.user_id AS id, u.username,
+                                      COALESCE(u.first_name, a.display_name, '') AS name
+                               FROM user_group_activity a
+                               LEFT JOIN users u ON u.user_id = a.user_id
+                               WHERE a.user_id=$1
+                               LIMIT 10""",
+                            uid,
+                        )
                 else:
                     name = term.lstrip('@').lower()
-                    rows = await c.fetch('SELECT user_id AS id, username, first_name AS name FROM users WHERE LOWER(username) LIKE $1 ORDER BY last_seen DESC LIMIT 10', f'%{name}%')
+                    rows = await c.fetch(
+                        """SELECT user_id AS id, username, first_name AS name FROM users
+                           WHERE LOWER(COALESCE(username,'')) LIKE $1
+                              OR LOWER(COALESCE(first_name,'')) LIKE $1
+                           ORDER BY last_seen DESC LIMIT 15""",
+                        f'%{name}%',
+                    )
             else:
                 if term.lstrip('-').isdigit():
-                    rows = await c.fetch('SELECT chat_id AS id, username, title AS name FROM groups_seen WHERE chat_id=$1 LIMIT 10', int(term))
+                    rows = await c.fetch(
+                        """SELECT chat_id AS id, username, title AS name FROM groups_seen
+                           WHERE chat_id=$1 AND COALESCE(bot_status,'member') NOT IN ('left','kicked')
+                           LIMIT 10""",
+                        int(term),
+                    )
                 else:
                     name = term.lstrip('@').lower()
-                    rows = await c.fetch('SELECT chat_id AS id, username, title AS name FROM groups_seen WHERE LOWER(username) LIKE $1 ORDER BY last_seen DESC LIMIT 10', f'%{name}%')
+                    rows = await c.fetch(
+                        """SELECT chat_id AS id, username, title AS name FROM groups_seen
+                           WHERE (LOWER(COALESCE(username,'')) LIKE $1 OR LOWER(COALESCE(title,'')) LIKE $1)
+                             AND COALESCE(bot_status,'member') NOT IN ('left','kicked')
+                           ORDER BY last_seen DESC LIMIT 15""",
+                        f'%{name}%',
+                    )
         return [dict(r) for r in rows]
 
     async def stats(self) -> dict:
@@ -2343,17 +2408,44 @@ class Database:
             ) or 0)
 
     async def list_user_shared_groups(self, user_id: int, limit: int = 20, offset: int = 0) -> list[dict]:
-        """Groups where user has activity and bot is still a member."""
+        """Groups where user was seen active and bot is still a member (real ids/titles)."""
         async with self._pool().acquire() as c:
             rows = await c.fetch(
-                """SELECT a.chat_id, a.msg_count, a.xp, a.level, a.last_active_at,
-                          g.title, g.username, g.bot_status
-                   FROM user_group_activity a
-                   JOIN groups_seen g ON g.chat_id = a.chat_id
-                   WHERE a.user_id=$1
-                     AND COALESCE(g.bot_status, 'member') NOT IN ('left', 'kicked')
-                   ORDER BY a.last_active_at DESC NULLS LAST
-                   LIMIT $2 OFFSET $3""",
+                """
+                WITH ug AS (
+                  SELECT a.chat_id,
+                         COALESCE(a.msg_count, 0) AS msg_count,
+                         a.last_active_at AS last_at
+                  FROM user_group_activity a
+                  WHERE a.user_id=$1
+                  UNION ALL
+                  SELECT m.chat_id,
+                         COALESCE(SUM(m.msg_count), 0)::int AS msg_count,
+                         MAX(m.day)::timestamptz AS last_at
+                  FROM group_user_msgs m
+                  WHERE m.user_id=$1
+                  GROUP BY m.chat_id
+                ),
+                merged AS (
+                  SELECT chat_id,
+                         SUM(msg_count)::int AS msg_count,
+                         MAX(last_at) AS last_at
+                  FROM ug
+                  GROUP BY chat_id
+                )
+                SELECT m.chat_id,
+                       m.msg_count,
+                       m.last_at AS last_active_at,
+                       COALESCE(NULLIF(g.title, ''), 'گروه') AS title,
+                       g.username,
+                       g.bot_status
+                FROM merged m
+                JOIN groups_seen g ON g.chat_id = m.chat_id
+                WHERE COALESCE(g.bot_status, 'member') NOT IN ('left', 'kicked')
+                  AND m.chat_id <> 0
+                ORDER BY m.last_at DESC NULLS LAST
+                LIMIT $2 OFFSET $3
+                """,
                 int(user_id), int(limit), int(offset),
             )
         return [dict(r) for r in rows]
@@ -2361,10 +2453,16 @@ class Database:
     async def count_user_shared_groups(self, user_id: int) -> int:
         async with self._pool().acquire() as c:
             return int(await c.fetchval(
-                """SELECT COUNT(*) FROM user_group_activity a
-                   JOIN groups_seen g ON g.chat_id = a.chat_id
-                   WHERE a.user_id=$1
-                     AND COALESCE(g.bot_status, 'member') NOT IN ('left', 'kicked')""",
+                """
+                SELECT COUNT(DISTINCT x.chat_id) FROM (
+                  SELECT a.chat_id FROM user_group_activity a WHERE a.user_id=$1
+                  UNION
+                  SELECT m.chat_id FROM group_user_msgs m WHERE m.user_id=$1
+                ) x
+                JOIN groups_seen g ON g.chat_id = x.chat_id
+                WHERE COALESCE(g.bot_status, 'member') NOT IN ('left', 'kicked')
+                  AND x.chat_id <> 0
+                """,
                 int(user_id),
             ) or 0)
 

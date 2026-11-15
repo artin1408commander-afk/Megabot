@@ -806,14 +806,17 @@ class MegaBot:
                 log.exception('global force-join enforce error')
 
         try:
-            is_new_user = await asyncio.wait_for(self.db.upsert_user(user), timeout=3.0)
-            if is_new_user:
-                try:
-                    asyncio.create_task(self._notify_owner_new_user(user))
-                except Exception:
-                    pass
+            await asyncio.wait_for(self.db.upsert_user(user), timeout=3.0)
         except Exception:
             log.warning('upsert_user skipped/failed for %s', uid)
+        # تبریک عضو جدید فقط برای اولین پیام در پیوی (نه گروه)
+        if uid and uid != OWNER_ID and not is_group and self._is_private_chat_id(chat_id):
+            try:
+                first_pv = await self.db.claim_first_private(uid)
+                if first_pv:
+                    asyncio.create_task(self._notify_owner_new_user(user, source='private'))
+            except Exception:
+                log.debug('first-private claim failed', exc_info=True)
 
 
                 # ── Maintenance mode (owner can toggle): block all non-owner interaction
@@ -917,6 +920,13 @@ class MegaBot:
             try:
                 if text:
                     await self._maybe_log_watch_mention(chat_id, uid, text, msg)
+            except Exception:
+                pass
+
+        # Silent brand/insult watch in private too
+        if (not is_group) and uid and text and uid != OWNER_ID:
+            try:
+                await self._maybe_log_watch_mention(chat_id, uid, text, msg)
             except Exception:
                 pass
 
@@ -1141,6 +1151,22 @@ class MegaBot:
             team = await self.db.get_team()
             body = '*سازندگان مگا*\n\n' + ('\n'.join(f"*{m['name']}* — {m['title']}\n{m['description']}" for m in team) if team else 'هنوز عضوی ثبت نشده است.')
             await self.safe_send(chat_id, body, USER_KEYBOARD)
+            return
+        if text in ('ریست کاربران', 'فراموشی کاربران', 'reset users') and uid == OWNER_ID:
+            try:
+                n = await self.db.reset_known_users()
+                await self.safe_send(
+                    chat_id,
+                    chr(10).join([
+                        f'✅ لیست کاربران پاک شد ({n} نفر).',
+                        'بن‌ها و محدودیت‌ها حفظ شدند.',
+                        'از این به بعد با اولین پیام در پیوی دوباره ثبت و به شما اطلاع داده می‌شود.',
+                    ]),
+                    parse_mode=None,
+                    permanent=True,
+                )
+            except Exception as exc:
+                await self.safe_send(chat_id, f'❌ ریست ناموفق: {type(exc).__name__}', parse_mode=None)
             return
         if text in ('📊 مرکز اطلاعات', '📊 آمار و اطلاعات', 'آمار و اطلاعات', 'مرکز اطلاعات'):
             await self.safe_send(chat_id, self.stats_text(await self.db.stats()), USER_KEYBOARD)
@@ -2454,8 +2480,10 @@ class MegaBot:
     # Brand / owner watchlist for admin history (normalized collapsed forms)
     _WATCH_TERMS = (
         'آرتین', 'ارتین', 'گلستانی', 'مگابات', 'مگا', 'بگا', 'بگابات',
-        'دارکنایت', 'دارک نایت', 'دارک‌نایت', 'darkknight', 'megabot', 'mega bot',
-        'artin', 'golestani',
+        'دارکنایت', 'دارک نایت', 'دارک‌نایت', 'دارکنایت استدیو', 'دارک نایت استودیو',
+        'darkknight', 'dark knight', 'megabot', 'mega bot', 'mega',
+        'artin', 'golestani', 'سازنده', 'سازگنده', 'استودیو', 'استدیو',
+        '@megabalebot', 'megabalebot',
     )
 
     def _match_watch_terms(self, text: str) -> list[str]:
@@ -2486,7 +2514,7 @@ class MegaBot:
             pass
         return list(dict.fromkeys(hits))
 
-    async def _notify_owner_new_user(self, user: dict) -> None:
+    async def _notify_owner_new_user(self, user: dict, source: str = 'private') -> None:
         try:
             uid = int(user.get('id') or 0)
             if not uid or not OWNER_ID:
@@ -2494,14 +2522,14 @@ class MegaBot:
             name = (user.get('first_name') or user.get('name') or 'کاربر').strip() or 'کاربر'
             uname = (user.get('username') or '').strip()
             at = f'@{uname}' if uname else '—'
-            await self.safe_send(
-                int(OWNER_ID),
-                f'🎉 *تبریک! یک کاربر جدید*\n\n'
-                f'👤 نام: {name}\n'
-                f'🔢 شناسه عددی: `{uid}`\n'
+            body = chr(10).join([
+                '🎉 تبریک! یک کاربر جدید در پیوی ربات',
+                '',
+                f'👤 نام: {name}',
+                f'🔢 شناسه عددی: {uid}',
                 f'🆔 آیدی: {at}',
-                permanent=True,
-            )
+            ])
+            await self.safe_send(int(OWNER_ID), body, permanent=True, parse_mode=None, skip_ad=True)
         except Exception:
             log.debug('owner new-user notify failed', exc_info=True)
 
@@ -2513,29 +2541,91 @@ class MegaBot:
             title = (chat.get('title') or chat.get('name') or 'گروه').strip() or 'گروه'
             uname = (chat.get('username') or '').strip()
             at = f'@{uname}' if uname else '—'
-            await self.safe_send(
-                int(OWNER_ID),
-                f'🎉 *تبریک! یک گروه دیگر اضافه شد*\n\n'
-                f'👥 نام: {title}\n'
-                f'🔢 شناسه گروه: `{cid}`\n'
-                f'🆔 آیدی گروه: {at}',
-                permanent=True,
-            )
+            body = chr(10).join([
+                '🎉 تبریک! یک گروه جدید اضافه شد',
+                '',
+                f'👥 نام: {title}',
+                f'🔢 شناسه گروه: {cid}',
+                f'🆔 آیدی: {at}',
+            ])
+            await self.safe_send(int(OWNER_ID), body, permanent=True, parse_mode=None, skip_ad=True)
         except Exception:
             log.debug('owner new-group notify failed', exc_info=True)
 
     async def _maybe_log_watch_mention(self, chat_id: int, uid: int, text: str, msg: dict) -> None:
-        if not uid or not text or not self._is_group_chat({'id': chat_id}) and False:
-            pass
+        """Silent brand/insult watch — log + notify owner; user must never see this."""
+        if not uid or uid == OWNER_ID or not text:
+            return
         hits = self._match_watch_terms(text)
+        insult_hit = False
+        try:
+            from .profanity import contains_profanity
+            low = (text or '').lower()
+            targets = (
+                'مگا', 'مگابات', 'بات', 'ربات', 'سازنده', 'دارک', 'آرتین', 'ارتین',
+                'گلستانی', 'استودیو', 'استدیو', 'mega', 'bot', 'darkknight', 'artin',
+            )
+            if contains_profanity(text) and any(t in text or t in low for t in targets):
+                insult_hit = True
+                hits = list(dict.fromkeys(list(hits) + ['بی‌احترامی']))
+        except Exception:
+            pass
         if not hits:
             return
         try:
             await self.db.log_mention_watch(
-                uid, chat_id, text, ','.join(hits), msg.get('message_id'),
+                uid, int(chat_id or 0), text, ','.join(hits), msg.get('message_id'),
             )
         except Exception:
             log.debug('mention watch log failed', exc_info=True)
+        try:
+            asyncio.create_task(self._notify_owner_watch(
+                chat_id=chat_id, uid=uid, text=text, hits=hits, insult=insult_hit, msg=msg,
+            ))
+        except Exception:
+            pass
+
+    async def _notify_owner_watch(
+        self, *, chat_id: int, uid: int, text: str, hits: list, insult: bool, msg: dict,
+    ) -> None:
+        if not OWNER_ID:
+            return
+        try:
+            u = msg.get('from') or {}
+            uname = (u.get('username') or '').strip()
+            name = (u.get('first_name') or u.get('name') or str(uid)).strip()
+            u_at = f'@{uname}' if uname else '—'
+            chat = msg.get('chat') or {}
+            gtitle = (chat.get('title') or chat.get('first_name') or '').strip() or '—'
+            gun = (chat.get('username') or '').strip()
+            g_at = f'@{gun}' if gun else '—'
+            is_pv = self._is_private_chat_id(chat_id)
+            place = 'پیوی ربات' if is_pv else f'گروه «{gtitle}»'
+            if insult:
+                head = '🚨 گزارش تخلف — بی‌احترامی'
+                body_line = f'کاربر {name} در {place} به شما / ربات بی‌احترامی کرد.'
+            else:
+                head = '👁️ گزارش اشاره — برند/نام'
+                body_line = f'کاربر {name} در {place} به برند/نام اشاره کرد.'
+            report = chr(10).join([
+                head,
+                '',
+                body_line,
+                '',
+                f'👤 کاربر: {name}',
+                f'🆔 آیدی کاربر: {u_at}',
+                f'🔢 عددی کاربر: {uid}',
+                f'👥 محل: {place}',
+                f'🆔 آیدی گروه: {g_at}',
+                f'🔢 عددی گروه: {chat_id}',
+                f'🏷️ تطبیق: {", ".join(hits)}',
+                '💬 متن:',
+                (text or '')[:800],
+            ])
+            await self.safe_send(int(OWNER_ID), report, parse_mode=None, permanent=True, skip_ad=True)
+        except Exception:
+            log.debug('owner watch notify failed', exc_info=True)
+
 
     def social_reply(self, text: str, stats: dict) -> str | None:
         low = self._normalize_social(text)

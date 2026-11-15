@@ -3398,7 +3398,8 @@ class MegaBot:
          'با ریپلای یا `@یوزرنیم`:\n'
          '• `اخطار` / `اخطار ۳` — افزودن اخطار\n'
          '• `حذف اخطار` — کم کردن یک اخطار\n'
-         '• `حذف تمام اخطارها`\n'
+         '• `حذف همه اخطارها` + ریپلای/@آیدی — صفر اخطار + آنبن + حذف سکوت\n'
+         '• `حذف تمام اخطارها` (بدون هدف) — پاک‌سازی همه اخطارهای گروه\n'
          '• `بن` / `آنبن` / `حذف بن` / `انبن`\n'
          '• `پاک ۵` — حذف N پیام آخر (حداکثر ۱۵۰)\n'
          '• ریپلای + `پاک` — از آن پیام به پایین\n'
@@ -6100,17 +6101,29 @@ class MegaBot:
         raw = re.sub(r'\s+', ' ', raw)
         low = raw
 
-        # Clear all warns in group (no target)
-        clear_all_phrases = (
+        # Clear all warns for one user (reply / @id) OR whole group if no target
+        # Examples: حذف همه اخطارها @x | حذف اخطارها (reply) | حذف تمام اخطار ها
+        clear_user_prefixes = (
             'حذف تمام اخطار ها', 'حذف تمام اخطارها', 'حذف همه اخطار ها', 'حذف همه اخطارها',
             'حذف احطار ها', 'حذف احطارها', 'حذف تمام احطار ها', 'حذف تمام احطارها',
             'پاک کردن تمام اخطارها', 'پاک کردن همه اخطارها',
+            'حذف اخطار ها', 'حذف اخطارها',
+            'پاک کردن اخطار ها', 'پاک کردن اخطارها',
+            'صفر کردن اخطار', 'صفر کردن اخطارها',
         )
-        if low in clear_all_phrases or low.startswith('حذف تمام اخطار') or low.startswith('حذف همه اخطار') or low.startswith('حذف احطار'):
-            return 'clear_warns_all', 0, ''
+        for phrase in sorted(clear_user_prefixes, key=len, reverse=True):
+            if low == phrase or low.startswith(phrase + ' '):
+                rest = low[len(phrase):].strip() if low.startswith(phrase) else ''
+                # With explicit @/id → clear that user; without rest, caller may still use reply
+                return 'clear_warns_user', 0, rest
+        if low.startswith('حذف تمام اخطار') or low.startswith('حذف همه اخطار') or low.startswith('حذف احطار'):
+            # leftover variants
+            parts = low.split(None, 3)
+            rest = ' '.join(parts[3:]) if len(parts) > 3 else ''
+            return 'clear_warns_user', 0, rest
 
-        # remove one warn: حذف اخطار [@user]
-        if low == 'حذف اخطار' or low.startswith('حذف اخطار '):
+        # remove one warn: حذف اخطار [@user]  (singular, not "اخطارها")
+        if low == 'حذف اخطار' or (low.startswith('حذف اخطار ') and not low.startswith('حذف اخطارها') and not low.startswith('حذف اخطار ها')):
             rest = low[len('حذف اخطار'):].strip()
             return 'remove_warn', 1, rest
 
@@ -6159,7 +6172,9 @@ class MegaBot:
             )
             return True
 
-        # Clear ALL warns in group — no target needed
+        # clear_warns_user handled after target resolve (with unmute/unban)
+        entities = msg.get('entities') or []
+        # Group-wide clear only when phrase has no reply and no @/id
         if action == 'clear_warns_all':
             try:
                 n = await self.db.clear_all_group_warns(chat_id)
@@ -6174,7 +6189,67 @@ class MegaBot:
                 await self.send_error(chat_id, '❌ پاک‌سازی اخطارها ناموفق بود.', reply_to=msg.get('message_id'))
             return True
 
-        entities = msg.get('entities') or []
+        if action == 'clear_warns_user':
+            target_uid, target_name, err = await self._resolve_mod_target(chat_id, rest, replied, entities)
+            if err or not target_uid:
+                # No target → clear ALL group warns (legacy behavior)
+                try:
+                    n = await self.db.clear_all_group_warns(chat_id)
+                    await self.safe_send(
+                        chat_id,
+                        chr(10).join([
+                            f'✅ تمام اخطارهای گروه پاک شد. ({n} کاربر)',
+                            'برای یک نفر: ریپلای کن یا @آیدی بنویس.',
+                        ]),
+                        reply_to=msg.get('message_id'),
+                        parse_mode=None,
+                    )
+                except Exception:
+                    log.exception('clear_all_group_warns failed')
+                    await self.send_error(chat_id, '❌ پاک‌سازی اخطارها ناموفق بود.', reply_to=msg.get('message_id'))
+                return True
+            # Clear warns + unmute + unban for this user
+            notes = []
+            try:
+                before = await self.db.get_warns(chat_id, target_uid)
+                await self.db.clear_warns(chat_id, target_uid)
+                notes.append(f'اخطارها صفر شد (قبل: {before})')
+            except Exception:
+                log.exception('clear_warns user failed')
+                notes.append('اخطار: خطا در پاک‌سازی')
+            # Unmute
+            try:
+                await self.api.restrict_chat_member(
+                    chat_id, target_uid,
+                    {
+                        'can_send_messages': True,
+                        'can_send_media_messages': True,
+                        'can_send_other_messages': True,
+                        'can_add_web_page_previews': True,
+                    },
+                )
+                notes.append('سکوت برداشته شد')
+            except Exception as exc:
+                log.debug('unmute after clear warns: %s', type(exc).__name__)
+                notes.append('سکوت: نیاز به دسترسی ربات')
+            # Unban (allows rejoin if banned)
+            try:
+                await self.api.unban_chat_member(chat_id, target_uid)
+                notes.append('بن برداشته شد')
+            except Exception as exc:
+                log.debug('unban after clear warns: %s', type(exc).__name__)
+                notes.append('بن: نیاز به دسترسی ربات')
+            try:
+                await self.db.log(uid, 'clear_warns_user', 'user', target_uid, {'chat_id': chat_id})
+            except Exception:
+                pass
+            body = chr(10).join([
+                f'✅ وضعیت {target_name} پاک‌سازی شد.',
+                *[f'• {n}' for n in notes],
+            ])
+            await self.msg.send_event(chat_id, 'user_unbanned', body, reply_to=msg.get('message_id'), parse_mode=None)
+            return True
+
         target_uid, target_name, err = await self._resolve_mod_target(chat_id, rest, replied, entities)
         if err or not target_uid:
             msg_err = err or (

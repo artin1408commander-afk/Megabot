@@ -183,7 +183,7 @@ class MegaBot:
             return keyboard
         return {'inline_keyboard': [[ad_btn]]}
 
-    async def safe_send(self, chat_id: int, text: str, keyboard: dict | None = None, reply_to: int | None = None, parse_mode: str | None = 'Markdown', *, skip_ad: bool = False, permanent: bool = False, force_text: bool = False, event_key: str | None = None) -> dict | None:
+    async def safe_send(self, chat_id: int, text: str, keyboard: dict | None = None, reply_to: int | None = None, parse_mode: str | None = 'Markdown', *, skip_ad: bool = False, permanent: bool = False, force_text: bool = False, event_key: str | None = None, ttl: float | None = None) -> dict | None:
         """Send with progressive fallbacks. Prefer no-reply first for reliability in groups.
 
         In private chats, attaches a neon asset photo (file_id-cached) unless force_text=True.
@@ -222,7 +222,7 @@ class MegaBot:
                     await self._metric_out(True)
                 except Exception:
                     pass
-                return self._maybe_ephemeral_result(chat_id, result, permanent=permanent)
+                return self._maybe_ephemeral_result(chat_id, result, permanent=permanent, ttl=ttl)
             except Exception as exc:
                 last_exc = exc
                 log.warning(
@@ -347,18 +347,27 @@ class MegaBot:
         self._maintenance_cache = (on, now + 5.0)
         return on
 
+    # Message lifetime policy (groups only; private chats are permanent)
+    # - command replies default: 4 minutes
+    # - lock panel: 3 minutes (pass ttl=180)
+    # - stats / welcome / media: permanent
+    # - moderation notices (ban/unban/kick): 30 seconds via _send_short_notice
+    TTL_COMMAND = 4 * 60
+    TTL_LOCK = 3 * 60
+    TTL_NOTICE = 30
+
     def _schedule_ephemeral_delete(
         self,
         chat_id: int,
-        message_id: int | None,
+        message_id: int,
         *,
         delay: float | None = None,
     ) -> None:
-        """Delete a group bot message after delay (default random 30–60s)."""
+        """Delete a group bot message after delay (default: command TTL = 4 min)."""
         if not message_id or self._is_private_chat_id(chat_id):
             return
         if delay is None:
-            delay = random.uniform(30.0, 60.0)
+            delay = float(self.TTL_COMMAND)
         else:
             delay = max(0.5, float(delay))
 
@@ -384,11 +393,13 @@ class MegaBot:
         chat_id: int,
         text: str,
         *,
-        seconds: float = 5.0,
+        seconds: float | None = None,
         reply_to: int | None = None,
         parse_mode: str | None = None,
     ) -> dict | None:
-        """Send a group notice that auto-deletes after a few seconds (for everyone)."""
+        """Group announcement (ban/unban/kick/…) — auto-deletes after ~30s."""
+        if seconds is None:
+            seconds = float(self.TTL_NOTICE)
         result = await self.safe_send(
             chat_id, text, reply_to=reply_to, parse_mode=parse_mode, permanent=True,
         )
@@ -401,7 +412,15 @@ class MegaBot:
             self._schedule_ephemeral_delete(chat_id, int(mid), delay=float(seconds))
         return result
 
-    def _maybe_ephemeral_result(self, chat_id: int, result: dict | None, *, permanent: bool) -> dict | None:
+    def _maybe_ephemeral_result(
+        self,
+        chat_id: int,
+        result: dict | None,
+        *,
+        permanent: bool = False,
+        ttl: float | None = None,
+    ) -> dict | None:
+        """Apply group TTL. permanent=True → never delete. ttl overrides default command TTL."""
         if permanent or not result or self._is_private_chat_id(chat_id):
             return result
         mid = result.get('message_id') if isinstance(result, dict) else None
@@ -410,10 +429,10 @@ class MegaBot:
             if isinstance(inner, dict):
                 mid = inner.get('message_id')
         if mid:
-            self._schedule_ephemeral_delete(chat_id, int(mid))
+            delay = float(ttl) if ttl is not None else float(self.TTL_COMMAND)
+            self._schedule_ephemeral_delete(chat_id, int(mid), delay=delay)
         return result
 
-    
     async def send_error(
         self,
         chat_id: int,
@@ -2336,7 +2355,7 @@ class MegaBot:
         else:
             lines.append('❌ sendMessage به گروه ناموفق — ربات احتمالاً دسترسی ارسال ندارد یا در گروه نیست')
 
-        await self.safe_send(reply_chat_id, '\n'.join(lines), parse_mode=None)
+        await self.safe_send(reply_chat_id, '\n'.join(lines), parse_mode=None, permanent=True)
 
 
     @staticmethod
@@ -2850,7 +2869,7 @@ class MegaBot:
             kicked = True
         except Exception as exc:
             log.info('joinrestrict kick failed chat=%s uid=%s: %s', chat_id, user_id, type(exc).__name__)
-            await self.safe_send(
+            await self._send_short_notice(
                 chat_id,
                 '❌ محدودیت عضویت فعال است ولی ربات نتوانست کاربر را اخراج کند. دسترسی Ban Members را بررسی کن.',
                 parse_mode=None,
@@ -5825,7 +5844,7 @@ class MegaBot:
         await self._send_short_notice(
             chat_id,
             f'✅ نتیجه پاک‌سازی\n🗑 پاک شد: {ok}\n⚠️ پاک نشد: {fail}\n📌 مجموع تلاش: {total}',
-            seconds=5.0,
+            seconds=30.0,
             parse_mode=None,
         )
         return True
@@ -5870,7 +5889,7 @@ class MegaBot:
             + f'⚠️ پاک نشد: {fail}' + chr(10)
             + f'📌 مجموع تلاش: {total}'
         )
-        await self._send_short_notice(chat_id, notice, seconds=5.0, parse_mode=None)
+        await self._send_short_notice(chat_id, notice, seconds=30.0, parse_mode=None)
 
     async def _resolve_mod_target(
         self, chat_id: int, text_arg: str, replied: dict, entities: list | None = None,
@@ -6506,7 +6525,7 @@ class MegaBot:
         detail = ''
         try:
             if ptype == 'warn_only':
-                await self.safe_send(chat_id, '🚨 تعداد اخطارهای کاربر به حد تعیین‌شده رسید.', parse_mode=None)
+                await self._send_short_notice(chat_id, '🚨 تعداد اخطارهای کاربر به حد تعیین‌شده رسید.', parse_mode=None)
                 success = True
                 detail = 'warn_only'
             elif ptype == 'mute':
@@ -6834,7 +6853,7 @@ class MegaBot:
             for i, u in enumerate(tops[:5], 1):
                 nm = u.get('name') or u.get('first_name') or u.get('username') or str(u.get('user_id'))
                 lines.append(f'  {i}. {nm} — {n(u.get("msg_count", 0))} پیام')
-        await self.safe_send(chat_id, '\n'.join(lines), parse_mode=None)
+        await self.safe_send(chat_id, '\n'.join(lines), parse_mode=None, permanent=True)
 
 
     async def _show_group_panel(self, chat_id: int, uid: int) -> None:
@@ -8200,7 +8219,7 @@ class MegaBot:
         if message_id:
             await self.safe_edit(chat_id, message_id, text, kb)
         else:
-            await self.safe_send(chat_id, text, kb)
+            await self.safe_send(chat_id, text, kb, ttl=float(self.TTL_LOCK))
 
     async def _show_warn_config(self, chat_id: int, message_id: int) -> None:
         gs = await self.db.get_group_settings(chat_id)

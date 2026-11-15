@@ -256,10 +256,11 @@ class MessageHub:
         reply_to: int | None = None,
         parse_mode: str | None = 'Markdown',
         permanent: bool = False,
+        ttl: float | None = None,
     ) -> dict | None:
         return await self.bot.safe_send(
             chat_id, text, keyboard=keyboard, reply_to=reply_to,
-            parse_mode=parse_mode, permanent=permanent,
+            parse_mode=parse_mode, permanent=permanent, ttl=ttl,
         )
 
     def allows_decorative_media(self, chat_id: int) -> bool:
@@ -284,9 +285,17 @@ class MessageHub:
         parse_mode: str | None = None,
         permanent: bool = False,
         force_text: bool = False,
+        ttl: float | None = None,
     ) -> dict | None:
-        """Always plain text. Decorative asset photos are permanently disabled."""
+        """Always plain text. Moderation notices auto-expire in ~30s."""
+        notice_keys = {
+            'user_banned', 'user_unbanned', 'user_kicked', 'user_muted',
+            'user_unmuted', 'user_warned', 'system_notice', 'operation_success',
+            'operation_error',
+        }
+        if event_key in notice_keys and ttl is None and not permanent:
+            ttl = 30.0
         return await self.send_text(
             chat_id, caption, keyboard=keyboard, reply_to=reply_to,
-            parse_mode=parse_mode, permanent=permanent,
+            parse_mode=parse_mode, permanent=permanent, ttl=ttl,
         )

@@ -548,6 +548,17 @@ class BaleAPI:
         return await self.call('copyMessage', payload, retries=0)
 
 
+    async def get_user_profile_photos(self, user_id: int, limit: int = 1, offset: int = 0) -> dict | None:
+        """Best-effort profile photos (Telegram-compatible method; may be unsupported on Bale)."""
+        try:
+            return await self.call(
+                'getUserProfilePhotos',
+                {'user_id': int(user_id), 'limit': int(limit), 'offset': int(offset)},
+                retries=0,
+            )
+        except Exception:
+            return None
+
     async def get_chat(self, chat_id) -> dict:
         """Resolve channel/group by id or @username."""
         return await self.call('getChat', {'chat_id': chat_id})

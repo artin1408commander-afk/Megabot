@@ -950,6 +950,11 @@ class MegaBot:
         if is_group and uid and uid != OWNER_ID:
             try:
                 if not await self._has_group_mod_power(chat_id, uid):
+                    try:
+                        if await self._enforce_profile_locks(chat_id, uid, msg, user):
+                            return
+                    except Exception:
+                        log.exception('profile lock enforce error')
                     blocked = await self._apply_security_filters(chat_id, uid, msg, text)
                     if blocked:
                         return
@@ -3933,13 +3938,51 @@ class MegaBot:
                 f'🟢 ایدی عددی : `{uid}`',
                 '',
                 f'🟢 مجموع پیام‌ها در این گروه: *{total_msgs:,}*',
+            ]
+            # Bio only when API actually returns it (never fabricate)
+            try:
+                bio = await self._fetch_user_bio(uid)
+            except Exception:
+                bio = None
+            if bio:
+                lines += ['', f'🟢 بیو : {bio[:400]}']
+            lines += [
                 '',
                 f'⭐ لول: *{level}* | امتیاز: *{prog["total_xp"]:,}*',
                 '',
                 '➖➖➖➖➖➖➖➖➖➖➖➖',
             ]
             body = '\n'.join(lines) + role_line
-            await self.safe_send(chat_id, body, reply_to=msg.get('message_id'))
+            # Prefer real profile photo when getUserProfilePhotos works
+            photo_sent = False
+            try:
+                res = await self.api.get_user_profile_photos(uid, limit=1)
+                photos = None
+                if isinstance(res, dict):
+                    photos = res.get('photos')
+                    if photos is None and isinstance(res.get('result'), dict):
+                        photos = res['result'].get('photos')
+                file_id = None
+                if photos:
+                    first = photos[0]
+                    sizes = first if isinstance(first, list) else [first]
+                    best = -1
+                    for s in sizes:
+                        if not isinstance(s, dict) or not s.get('file_id'):
+                            continue
+                        area = int(s.get('width') or 0) * int(s.get('height') or 0)
+                        if area >= best:
+                            best = area
+                            file_id = s.get('file_id')
+                if file_id:
+                    await self.api.send_photo(
+                        chat_id, file_id, body, None, 'Markdown', msg.get('message_id'),
+                    )
+                    photo_sent = True
+            except Exception as exc:
+                log.debug('profile photo send failed: %s', type(exc).__name__)
+            if not photo_sent:
+                await self.safe_send(chat_id, body, reply_to=msg.get('message_id'))
             return
 
         # mode == level
@@ -6191,6 +6234,15 @@ class MegaBot:
         ('anticontact', '👤 قفل مخاطب'),
         ('joinrestrict', '🚷 محدودیت عضویت'),
         ('interaction', '💬 تعامل (ریپلای/واکنش)'),
+        # Profile name/bio locks (name works from message; bio only if API returns it)
+        ('name_link', '🔗 لینک در نام'),
+        ('name_profane', '🤬 فحش در نام'),
+        ('name_addomain', '📣 دامنه تبلیغ در نام'),
+        ('name_adid', '🆔 آیدی تبلیغ در نام'),
+        ('bio_link', '🔗 لینک در بیو'),
+        ('bio_profane', '🤬 فحش در بیو'),
+        ('bio_addomain', '📣 دامنه تبلیغ در بیو'),
+        ('bio_adid', '🆔 آیدی تبلیغ در بیو'),
     ]
 
 
@@ -6322,6 +6374,171 @@ class MegaBot:
             await self.safe_send(chat_id, text, parse_mode=None)
         except Exception:
             log.exception('schedule lock announce failed chat=%s', chat_id)
+
+
+    # ── Profile name / bio locks ─────────────────────────────────────────
+    _PROFILE_CACHE_TTL = 120.0  # seconds
+
+    def _display_name_of(self, user: dict | None) -> str:
+        if not user:
+            return ''
+        parts = [user.get('first_name') or '', user.get('last_name') or '']
+        return ' '.join(p for p in parts if p).strip()
+
+    async def _fetch_user_bio(self, user_id: int) -> str | None:
+        """Try to read user bio via getChat(user_id). Returns None if API has no bio field."""
+        cache = getattr(self, '_bio_cache', None)
+        if cache is None:
+            self._bio_cache = {}
+            cache = self._bio_cache
+        now = time.time()
+        hit = cache.get(int(user_id))
+        if hit and hit[1] > now:
+            return hit[0]
+        bio = None
+        try:
+            chat = await self.api.get_chat(int(user_id))
+            if isinstance(chat, dict):
+                for key in ('bio', 'about', 'description', 'personal_chat'):
+                    val = chat.get(key)
+                    if isinstance(val, str) and val.strip():
+                        bio = val.strip()
+                        break
+                    if isinstance(val, dict):
+                        # nested personal_chat style
+                        for k2 in ('bio', 'about', 'description'):
+                            v2 = val.get(k2)
+                            if isinstance(v2, str) and v2.strip():
+                                bio = v2.strip()
+                                break
+        except Exception as exc:
+            log.debug('getChat bio uid=%s: %s', user_id, type(exc).__name__)
+        cache[int(user_id)] = (bio, now + self._PROFILE_CACHE_TTL)
+        if len(cache) > 3000:
+            # drop oldest half
+            items = sorted(cache.items(), key=lambda kv: kv[1][1])
+            for k, _ in items[: len(items) // 2]:
+                cache.pop(k, None)
+        return bio
+
+    def _profile_text_violations(self, body: str, *, check_link: bool, check_profane: bool,
+                                 check_addomain: bool, check_adid: bool) -> list[str]:
+        """Return list of violation labels found in profile text."""
+        from .anti_abuse import message_has_link, detect_advertisement, collapse_text
+        from .profanity import contains_profanity
+        hits: list[str] = []
+        body = body or ''
+        if not body.strip():
+            return hits
+        if check_link and message_has_link(body, None, strict_latin=True):
+            hits.append('لینک')
+        if check_profane and contains_profanity(body):
+            hits.append('کلمه ممنوعه')
+        if check_addomain or check_adid:
+            try:
+                ad = detect_advertisement(body)
+                is_ad = bool(getattr(ad, 'hit', False))
+            except Exception:
+                is_ad = False
+            collapsed = ''
+            try:
+                collapsed = collapse_text(body)
+            except Exception:
+                collapsed = body.lower()
+            if check_addomain and (is_ad or any(x in collapsed for x in (
+                'ble.ir', 't.me', 'rubika', 'eitaa', 'splus', 'instagram', 'telegram',
+            ))):
+                hits.append('دامنه/تبلیغ')
+            if check_adid:
+                import re
+                if re.search(r'(?:^|[^\w])@([A-Za-z][\w]{2,31})\b', body) or re.search(r'uid\s*:\s*\d{3,}', body, re.I):
+                    hits.append('آیدی تبلیغاتی')
+        # unique preserve order
+        seen = set()
+        out = []
+        for h in hits:
+            if h not in seen:
+                seen.add(h)
+                out.append(h)
+        return out
+
+    async def _enforce_profile_locks(self, chat_id: int, uid: int, msg: dict, user: dict) -> bool:
+        """If active name/bio locks match, delete message and optionally DM user. Returns True if blocked."""
+        if not uid or uid == OWNER_ID:
+            return False
+        try:
+            if await self._is_chat_admin(chat_id, uid):
+                return False
+        except Exception:
+            pass
+        try:
+            gs = await self.db.get_group_settings(chat_id)
+        except Exception:
+            return False
+        sec = gs.get('security') or {}
+        name_keys = ('name_link', 'name_profane', 'name_addomain', 'name_adid')
+        bio_keys = ('bio_link', 'bio_profane', 'bio_addomain', 'bio_adid')
+        if not any(sec.get(k) for k in name_keys + bio_keys):
+            return False
+
+        name = self._display_name_of(user)
+        violations: list[str] = []
+        if any(sec.get(k) for k in name_keys) and name:
+            violations += self._profile_text_violations(
+                name,
+                check_link=bool(sec.get('name_link')),
+                check_profane=bool(sec.get('name_profane')),
+                check_addomain=bool(sec.get('name_addomain')),
+                check_adid=bool(sec.get('name_adid')),
+            )
+        if any(sec.get(k) for k in bio_keys):
+            bio = await self._fetch_user_bio(uid)
+            if bio:
+                violations += self._profile_text_violations(
+                    bio,
+                    check_link=bool(sec.get('bio_link')),
+                    check_profane=bool(sec.get('bio_profane')),
+                    check_addomain=bool(sec.get('bio_addomain')),
+                    check_adid=bool(sec.get('bio_adid')),
+                )
+            # if bio unavailable, do NOT punish (honest API limit)
+
+        if not violations:
+            return False
+
+        kind = ' / '.join(dict.fromkeys(violations))
+        mid = msg.get('message_id')
+        if mid:
+            try:
+                await self.api.delete_message(chat_id, int(mid))
+            except Exception:
+                pass
+
+        # DM user (best-effort)
+        uname = (user.get('first_name') or 'کاربر')[:40]
+        dm = (
+            f'{uname} عزیز،\n\n'
+            f'در نام یا بیوی حساب شما موردی مغایر با قوانین گروه شناسایی شده است:\n\n'
+            f'نوع تخلف: {kind}\n\n'
+            f'لطفاً آن را از پروفایل خود حذف کنید تا بتوانید در گروه گفتگو کنید.\n\n'
+            f'با تشکر 🌱'
+        )
+        try:
+            await self.api.send_message(uid, dm, None, None, None, fast=True)
+        except Exception:
+            pass
+
+        # short group notice
+        try:
+            await self._send_short_notice(
+                chat_id,
+                f'⚠️ پیام حذف شد — پروفایل کاربر با قوانین گروه هم‌خوان نیست ({kind}).',
+                seconds=30.0,
+                parse_mode=None,
+            )
+        except Exception:
+            pass
+        return True
 
     async def _apply_security_filters(self, chat_id: int, uid: int, msg: dict, text: str) -> bool:
         """Return True if message was blocked (caller should stop processing).

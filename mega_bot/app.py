@@ -4935,26 +4935,45 @@ class MegaBot:
             rows = await self.db.list_mention_watch(target_id, limit=per, offset=page * per)
             total_pages = max(1, (total + per - 1) // per)
             if not rows and page == 0:
-                text = f'📜 *سوابق کاربر* `{target_id}`\n\nموردی ثبت نشده.'
+                text = f'📜 سوابق کاربر `{target_id}`\n\nموردی ثبت نشده.'
                 kb = inline([
                     [('↩️ بازگشت', f'adm:target:user:{target_id}', STYLE_DANGER),
                      ('✖️ بستن', 'close', STYLE_DANGER)],
                 ])
                 await self.safe_edit(chat_id, message_id, text, kb)
                 return
-            lines = [f'📜 *سوابق کاربر* `{target_id}` — صفحه {page+1}/{total_pages} (کل {total})\n']
+            lines = [f'📜 سوابق کاربر `{target_id}` — صفحه {page+1}/{total_pages} (کل {total})', '']
             for r in rows:
-                body = (r.get('message_text') or '')[:180].replace('`', "'")
+                body = (r.get('message_text') or '')[:300].replace('`', "'")
+                terms = (r.get('matched_terms') or '').strip() or '—'
+                gtitle = (r.get('group_title') or '').strip()
                 gname = r.get('group_username')
                 gat = f'@{gname}' if gname else '—'
-                gid = r.get('chat_id')
-                lines.append(
-                    f'پیام: {body}\n'
-                    f'آیدی گروه: {gat}\n'
-                    f'شناسه عددی گروه: `{gid}`\n'
-                    f'━━━━━━━━━━━━'
-                )
-            text = '\n'.join(lines)
+                gid = int(r.get('chat_id') or 0)
+                if gid and (not gtitle or gtitle in ('0', 'گروه')):
+                    try:
+                        info = await self.api.get_chat(gid)
+                        if isinstance(info, dict):
+                            gtitle = (info.get('title') or info.get('username') or gtitle or '').strip()
+                            if not gname:
+                                gname = info.get('username')
+                                gat = f'@{gname}' if gname else '—'
+                    except Exception:
+                        pass
+                if not gtitle:
+                    gtitle = 'پیوی' if gid > 0 else 'گروه'
+                place = f'{gtitle} ({gat})' if gid else 'نامشخص'
+                created = r.get('created_at')
+                when = str(created)[:19] if created else '—'
+                lines.append(chr(10).join([
+                    f'💬 پیام: {body}',
+                    f'🏷️ تطبیق: {terms}',
+                    f'👥 محل: {place}',
+                    f'🔢 شناسه گروه: {gid if gid else "—"}',
+                    f'🕒 زمان: {when}',
+                    '━━━━━━━━━━━━',
+                ]))
+            text = chr(10).join(lines)
             nav = []
             if page > 0:
                 nav.append(('⬅️ قبلی', f'adm:uhist:{target_id}:{page-1}'))
@@ -4987,18 +5006,53 @@ class MegaBot:
                 return
             page = max(0, page)
             per = 8
+            # Live probe: check membership in recent bot groups (first page only)
+            if page == 0:
+                try:
+                    await self._probe_user_group_membership(target_id)
+                except Exception:
+                    log.debug('live group probe failed', exc_info=True)
             total = await self.db.count_user_shared_groups(target_id)
             rows = await self.db.list_user_shared_groups(target_id, limit=per, offset=page * per)
             total_pages = max(1, (total + per - 1) // per)
-            lines = [f'👥 *گروه‌های مشترک* `{target_id}` — {page+1}/{total_pages} (کل {total})\n']
+            lines = [
+                f'👥 گروه‌های مشترک `{target_id}` — {page+1}/{total_pages} (کل {total})',
+                'فقط گروه‌هایی که ربات هنوز عضو آن‌هاست و کاربر در آن‌ها دیده شده.',
+                '',
+            ]
             if not rows:
-                lines.append('گروه مشترکی یافت نشد (فقط گروه‌هایی که کاربر در آن‌ها فعالیت داشته و ربات عضو است).')
+                lines.append('گروه مشترکی یافت نشد.')
             for r in rows:
-                title = (r.get('title') or 'گروه').strip() or 'گروه'
+                cid = int(r.get('chat_id') or 0)
+                if not cid or cid == 0:
+                    continue
+                title = (r.get('title') or '').strip()
                 un = r.get('username')
+                msgs = int(r.get('msg_count') or 0)
+                if not title or title in ('0', 'گروه', 'None'):
+                    try:
+                        info = await self.api.get_chat(cid)
+                        if isinstance(info, dict):
+                            title = (info.get('title') or info.get('first_name') or '').strip() or title
+                            un = info.get('username') or un
+                            # persist better title for next time
+                            try:
+                                await self.db.upsert_group({
+                                    'id': cid,
+                                    'title': title,
+                                    'username': un,
+                                }, bot_status=r.get('bot_status') or 'member')
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+                title = title or f'گروه {cid}'
                 at = f'@{un}' if un else '—'
                 lines.append(
-                    f'• {title}\n  آیدی: {at}\n  شناسه: `{r.get("chat_id")}` | پیام≈{r.get("msg_count") or 0}'
+                    f'• {title}' + chr(10)
+                    + f'  آیدی: {at}' + chr(10)
+                    + f'  شناسه: `{cid}`' + chr(10)
+                    + f'  پیام‌های دیده‌شده ≈ {msgs}'
                 )
             nav = []
             if page > 0:
@@ -5012,7 +5066,7 @@ class MegaBot:
                 ('↩️ بازگشت', f'adm:target:user:{target_id}', STYLE_DANGER),
                 ('✖️ بستن', 'close', STYLE_DANGER),
             ])
-            await self.safe_edit(chat_id, message_id, '\n'.join(lines), inline(kb_rows))
+            await self.safe_edit(chat_id, message_id, chr(10).join(lines), inline(kb_rows), parse_mode=None)
             return
 
         if kind == 'uwarn':
@@ -5202,6 +5256,62 @@ class MegaBot:
 
     # ─── Broadcast system ───────────────────────────────────────────────
 
+
+
+    async def _probe_user_group_membership(self, user_id: int, max_groups: int = 40) -> int:
+        """Best-effort: ask Bale which known groups still contain this user.
+        Records hits into user_group_activity so shared-group list stays accurate.
+        """
+        if not user_id:
+            return 0
+        try:
+            groups = await self.db.list_active_bot_groups(limit=max_groups)
+        except Exception:
+            return 0
+        found = 0
+        sem = asyncio.Semaphore(6)
+
+        async def _one(g: dict) -> None:
+            nonlocal found
+            cid = int(g.get('chat_id') or 0)
+            if not cid:
+                return
+            async with sem:
+                try:
+                    mem = await self.api.get_chat_member(cid, int(user_id))
+                except Exception:
+                    return
+                if not isinstance(mem, dict):
+                    return
+                # unwrap result
+                st = mem.get('status') or (mem.get('result') or {}).get('status') if isinstance(mem.get('result'), dict) else mem.get('status')
+                if not st and isinstance(mem.get('result'), dict):
+                    st = mem['result'].get('status')
+                st = (st or '').lower()
+                if st in ('member', 'administrator', 'creator', 'restricted'):
+                    found += 1
+                    try:
+                        name = ''
+                        user = mem.get('user') or (mem.get('result') or {}).get('user') if isinstance(mem.get('result'), dict) else None
+                        if isinstance(user, dict):
+                            name = (user.get('first_name') or user.get('name') or '')[:80]
+                        await self.db.record_activity_xp(
+                            cid, int(user_id),
+                            grant_xp=False,
+                            display_name=name,
+                            count_message=False,
+                            messages_per_xp=999999,
+                            xp_per_grant=0,
+                        )
+                    except Exception:
+                        try:
+                            # minimal touch via usage event
+                            await self.db.record_usage(int(user_id), {'id': cid, 'type': 'group'}, 'member_probe')
+                        except Exception:
+                            pass
+
+        await asyncio.gather(*[_one(g) for g in groups], return_exceptions=True)
+        return found
 
     async def _resolve_group_ref(self, ref: str) -> tuple[int | None, str, str | None]:
         """Resolve @username / numeric id to a group chat_id. Returns (id, label, error)."""

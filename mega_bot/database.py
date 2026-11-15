@@ -2391,7 +2391,8 @@ class Database:
         async with self._pool().acquire() as c:
             rows = await c.fetch(
                 """SELECT m.id, m.user_id, m.chat_id, m.message_id, m.message_text, m.matched_terms, m.created_at,
-                          g.title AS group_title, g.username AS group_username
+                          COALESCE(NULLIF(TRIM(g.title), ''), NULLIF(TRIM(g.username), ''), '') AS group_title,
+                          g.username AS group_username
                    FROM mention_watch_logs m
                    LEFT JOIN groups_seen g ON g.chat_id = m.chat_id
                    WHERE m.user_id=$1
@@ -2408,23 +2409,39 @@ class Database:
             ) or 0)
 
     async def list_user_shared_groups(self, user_id: int, limit: int = 20, offset: int = 0) -> list[dict]:
-        """Groups where user was seen active and bot is still a member (real ids/titles)."""
+        """Groups where user was seen (activity/msgs/usage) and bot is still a member."""
         async with self._pool().acquire() as c:
             rows = await c.fetch(
                 """
                 WITH ug AS (
                   SELECT a.chat_id,
-                         COALESCE(a.msg_count, 0) AS msg_count,
-                         a.last_active_at AS last_at
+                         COALESCE(a.total_msgs, 0)::int AS msg_count,
+                         COALESCE(a.last_xp_at, a.updated_at) AS last_at
                   FROM user_group_activity a
-                  WHERE a.user_id=$1
+                  WHERE a.user_id=$1 AND a.chat_id <> 0
                   UNION ALL
                   SELECT m.chat_id,
                          COALESCE(SUM(m.msg_count), 0)::int AS msg_count,
                          MAX(m.day)::timestamptz AS last_at
                   FROM group_user_msgs m
-                  WHERE m.user_id=$1
+                  WHERE m.user_id=$1 AND m.chat_id <> 0
                   GROUP BY m.chat_id
+                  UNION ALL
+                  SELECT e.chat_id,
+                         COUNT(*)::int AS msg_count,
+                         MAX(e.created_at) AS last_at
+                  FROM usage_events e
+                  WHERE e.user_id=$1
+                    AND e.chat_id <> 0
+                    AND e.chat_type IS DISTINCT FROM 'private'
+                  GROUP BY e.chat_id
+                  UNION ALL
+                  SELECT w.chat_id,
+                         COUNT(*)::int AS msg_count,
+                         MAX(w.created_at) AS last_at
+                  FROM mention_watch_logs w
+                  WHERE w.user_id=$1 AND w.chat_id <> 0
+                  GROUP BY w.chat_id
                 ),
                 merged AS (
                   SELECT chat_id,
@@ -2436,14 +2453,15 @@ class Database:
                 SELECT m.chat_id,
                        m.msg_count,
                        m.last_at AS last_active_at,
-                       COALESCE(NULLIF(g.title, ''), 'گروه') AS title,
+                       COALESCE(NULLIF(TRIM(g.title), ''), NULLIF(TRIM(g.username), ''), 'گروه') AS title,
                        g.username,
                        g.bot_status
                 FROM merged m
                 JOIN groups_seen g ON g.chat_id = m.chat_id
                 WHERE COALESCE(g.bot_status, 'member') NOT IN ('left', 'kicked')
                   AND m.chat_id <> 0
-                ORDER BY m.last_at DESC NULLS LAST
+                  AND m.chat_id < 0
+                ORDER BY m.last_at DESC NULLS LAST, m.msg_count DESC
                 LIMIT $2 OFFSET $3
                 """,
                 int(user_id), int(limit), int(offset),
@@ -2455,16 +2473,35 @@ class Database:
             return int(await c.fetchval(
                 """
                 SELECT COUNT(DISTINCT x.chat_id) FROM (
-                  SELECT a.chat_id FROM user_group_activity a WHERE a.user_id=$1
+                  SELECT a.chat_id FROM user_group_activity a WHERE a.user_id=$1 AND a.chat_id <> 0
                   UNION
-                  SELECT m.chat_id FROM group_user_msgs m WHERE m.user_id=$1
+                  SELECT m.chat_id FROM group_user_msgs m WHERE m.user_id=$1 AND m.chat_id <> 0
+                  UNION
+                  SELECT e.chat_id FROM usage_events e
+                    WHERE e.user_id=$1 AND e.chat_id <> 0 AND e.chat_type IS DISTINCT FROM 'private'
+                  UNION
+                  SELECT w.chat_id FROM mention_watch_logs w WHERE w.user_id=$1 AND w.chat_id <> 0
                 ) x
                 JOIN groups_seen g ON g.chat_id = x.chat_id
                 WHERE COALESCE(g.bot_status, 'member') NOT IN ('left', 'kicked')
-                  AND x.chat_id <> 0
+                  AND x.chat_id < 0
                 """,
                 int(user_id),
             ) or 0)
+
+    async def list_active_bot_groups(self, limit: int = 80) -> list[dict]:
+        """Recent groups where bot is still a member — for live membership probes."""
+        async with self._pool().acquire() as c:
+            rows = await c.fetch(
+                """SELECT chat_id, title, username, bot_status, last_seen
+                   FROM groups_seen
+                   WHERE COALESCE(bot_status, 'member') NOT IN ('left', 'kicked')
+                     AND chat_id < 0
+                   ORDER BY last_seen DESC NULLS LAST
+                   LIMIT $1""",
+                int(limit),
+            )
+        return [dict(r) for r in rows]
 
     async def list_force_joins(self, scope: str = 'global', host_chat_id: int = 0) -> list[dict]:
         async with self._pool().acquire() as c:

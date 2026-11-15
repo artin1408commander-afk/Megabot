@@ -5577,17 +5577,34 @@ class MegaBot:
         self._broadcast_running = True
         self._broadcast_cancel.discard(admin_uid)
         target = state.get('bc_target', 'users')
-        payload = state.get('bc_payload') or {}
+        payload = dict(state.get('bc_payload') or {})
         progress_chat = int(state.get('progress_chat') or report_chat)
         progress_mid = state.get('progress_mid')
-        concurrency = 14
+        kind0 = payload.get('kind') or 'text'
+        # Media needs lower concurrency to avoid API drops
+        concurrency = 6 if kind0 in ('photo', 'video', 'document', 'animation', 'copy') else 12
         # Build ad keyboard once (not per destination)
         try:
-            if (payload.get('kind') or 'text') != 'animation':
-                payload = dict(payload)
+            if kind0 != 'animation':
                 payload['_kb'] = await self._with_ad_keyboard(None)
         except Exception:
             pass
+        # Preload media bytes once so every dest can be reached even if file_id is chat-bound
+        try:
+            fid = payload.get('file_id')
+            if fid and kind0 in ('photo', 'video', 'document', 'animation') and not payload.get('_bytes'):
+                raw, name = await self.api.get_file_bytes(fid, 25 * 1024 * 1024)
+                if raw:
+                    payload['_bytes'] = raw
+                    payload['_filename'] = name or {
+                        'photo': 'photo.jpg',
+                        'video': 'video.mp4',
+                        'document': 'file.bin',
+                        'animation': 'anim.gif',
+                    }.get(kind0, 'file.bin')
+                    log.info('broadcast media cached bytes=%s name=%s', len(raw), payload['_filename'])
+        except Exception:
+            log.warning('broadcast media preload failed', exc_info=True)
         try:
             if target == 'users':
                 ids = await self.db.private_user_ids()
@@ -5598,6 +5615,8 @@ class MegaBot:
                     (await self.db.private_user_ids()) + (await self.db.group_chat_ids())
                 ))
             bot_id = getattr(self, 'bot_id', None)
+            # unique, drop invalid zeros, drop self/bot
+            ids = list(dict.fromkeys(int(i) for i in ids if i))
             ids = [i for i in ids if i != admin_uid and i != bot_id]
             total = len(ids)
             sent = failed = blocked = 0
@@ -5632,23 +5651,34 @@ class MegaBot:
                 if admin_uid in self._broadcast_cancel:
                     return
                 ok = False
-                try:
-                    ok = await self._broadcast_one(dest, payload)
-                except Exception as exc:
-                    err = str(exc).lower()
-                    async with lock:
-                        failed += 1
-                        if any(x in err for x in ('blocked', 'forbidden', 'chat not found', 'have no rights', 'kicked')):
-                            blocked += 1
-                    log.warning('broadcast dest=%s err=%s', dest, type(exc).__name__)
-                    async with lock:
-                        done += 1
-                    return
+                last_err = ''
+                for attempt in range(3):
+                    if admin_uid in self._broadcast_cancel:
+                        break
+                    try:
+                        ok = await self._broadcast_one(dest, payload)
+                        if ok:
+                            break
+                    except Exception as exc:
+                        last_err = type(exc).__name__
+                        err = str(exc).lower()
+                        if any(x in err for x in (
+                            'blocked', 'forbidden', 'chat not found', 'have no rights',
+                            'kicked', 'user is deactivated', 'peer_id',
+                        )):
+                            ok = False
+                            break
+                        await asyncio.sleep(0.35 * (attempt + 1))
+                        continue
+                    # soft fail without exception — retry once
+                    await asyncio.sleep(0.25 * (attempt + 1))
                 async with lock:
                     if ok:
                         sent += 1
                     else:
                         failed += 1
+                        if last_err:
+                            blocked += 1
                     done += 1
 
             await _edit_progress(force=True)
@@ -5775,16 +5805,56 @@ class MegaBot:
                     except Exception:
                         return False
                 return any_ok
+            # Prefer copy when we still have the original admin message
+            if payload.get('from_chat_id') and payload.get('message_id') and kind in (
+                'photo', 'video', 'document', 'animation', 'copy',
+            ):
+                try:
+                    result = await self.api.copy_message(
+                        dest, int(payload['from_chat_id']), int(payload['message_id']), kb,
+                    )
+                    if _ok(result):
+                        return True
+                except Exception:
+                    pass
             if kind == 'photo':
+                if payload.get('_bytes'):
+                    result = await self.api.send_photo_bytes(
+                        dest, payload['_bytes'], payload.get('_filename') or 'photo.jpg',
+                        payload.get('caption'), kb, payload.get('parse_mode'),
+                    )
+                    return _ok(result)
                 result = await self.api.send_photo(dest, payload['file_id'], payload.get('caption'), kb, payload.get('parse_mode'))
                 return _ok(result)
             if kind == 'video':
+                if payload.get('_bytes'):
+                    # send as document/video file upload
+                    try:
+                        result = await self.api.send_document_file(
+                            dest, payload['_bytes'], payload.get('_filename') or 'video.mp4',
+                            payload.get('caption') or '',
+                        )
+                        return _ok(result)
+                    except Exception:
+                        pass
                 result = await self.api.send_video(dest, payload['file_id'], payload.get('caption'), kb, payload.get('parse_mode'))
                 return _ok(result)
             if kind == 'document':
+                if payload.get('_bytes'):
+                    result = await self.api.send_document_file(
+                        dest, payload['_bytes'], payload.get('_filename') or 'file.bin',
+                        payload.get('caption') or '',
+                    )
+                    return _ok(result)
                 result = await self.api.send_document(dest, payload['file_id'], payload.get('caption'), kb, payload.get('parse_mode'))
                 return _ok(result)
             if kind == 'animation':
+                if payload.get('_bytes'):
+                    result = await self.api.send_animation_bytes(
+                        dest, payload['_bytes'], payload.get('_filename') or 'anim.gif',
+                        payload.get('caption') or '',
+                    )
+                    return _ok(result)
                 result = await self.api.send_animation_file_id(dest, payload['file_id'], payload.get('caption'), None, payload.get('parse_mode'))
                 return _ok(result)
             if kind == 'copy':
@@ -5813,19 +5883,43 @@ class MegaBot:
             best = photos[-1] if isinstance(photos, list) else photos
             fid = best.get('file_id')
             if fid:
-                return {'kind': 'photo', 'file_id': fid, 'caption': caption or text or None, 'parse_mode': None}
+                mid = msg.get('message_id')
+                from_chat = (msg.get('chat') or {}).get('id')
+                out = {'kind': 'photo', 'file_id': fid, 'caption': caption or text or None, 'parse_mode': None}
+                if mid and from_chat:
+                    out['from_chat_id'] = int(from_chat)
+                    out['message_id'] = int(mid)
+                return out
         if msg.get('video'):
             fid = msg['video'].get('file_id')
             if fid:
-                return {'kind': 'video', 'file_id': fid, 'caption': caption or text or None, 'parse_mode': None}
+                mid = msg.get('message_id')
+                from_chat = (msg.get('chat') or {}).get('id')
+                out = {'kind': 'video', 'file_id': fid, 'caption': caption or text or None, 'parse_mode': None}
+                if mid and from_chat:
+                    out['from_chat_id'] = int(from_chat)
+                    out['message_id'] = int(mid)
+                return out
         if msg.get('animation'):
             fid = msg['animation'].get('file_id')
             if fid:
-                return {'kind': 'animation', 'file_id': fid, 'caption': caption or text or None, 'parse_mode': None}
+                mid = msg.get('message_id')
+                from_chat = (msg.get('chat') or {}).get('id')
+                out = {'kind': 'animation', 'file_id': fid, 'caption': caption or text or None, 'parse_mode': None}
+                if mid and from_chat:
+                    out['from_chat_id'] = int(from_chat)
+                    out['message_id'] = int(mid)
+                return out
         if msg.get('document'):
             fid = msg['document'].get('file_id')
             if fid:
-                return {'kind': 'document', 'file_id': fid, 'caption': caption or text or None, 'parse_mode': None}
+                mid = msg.get('message_id')
+                from_chat = (msg.get('chat') or {}).get('id')
+                out = {'kind': 'document', 'file_id': fid, 'caption': caption or text or None, 'parse_mode': None}
+                if mid and from_chat:
+                    out['from_chat_id'] = int(from_chat)
+                    out['message_id'] = int(mid)
+                return out
         if text and text.strip():
             return {'kind': 'text', 'text': text.strip(), 'parse_mode': None}
         # Fallback: copy original message

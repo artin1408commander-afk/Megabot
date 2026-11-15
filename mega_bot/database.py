@@ -695,13 +695,33 @@ class Database:
         return prev_i, new_i
 
     async def private_user_ids(self) -> list[int]:
+        """All known private-chat users (users table + private usage events)."""
         async with self._pool().acquire() as c:
-            rows = await c.fetch('SELECT user_id FROM users ORDER BY user_id')
-        return [int(r['user_id']) for r in rows]
+            rows = await c.fetch(
+                """
+                SELECT DISTINCT user_id FROM (
+                  SELECT user_id FROM users
+                  UNION
+                  SELECT user_id FROM usage_events
+                    WHERE user_id IS NOT NULL AND chat_type = 'private'
+                ) u
+                WHERE user_id IS NOT NULL
+                ORDER BY user_id
+                """
+            )
+        return [int(r['user_id']) for r in rows if r['user_id'] is not None]
 
     async def group_chat_ids(self) -> list[int]:
+        """All groups/channels where bot is still a member (not left/kicked)."""
         async with self._pool().acquire() as c:
-            rows = await c.fetch('SELECT chat_id FROM groups_seen ORDER BY chat_id')
+            try:
+                rows = await c.fetch(
+                    """SELECT chat_id FROM groups_seen
+                       WHERE COALESCE(bot_status, 'member') NOT IN ('left', 'kicked')
+                       ORDER BY chat_id"""
+                )
+            except Exception:
+                rows = await c.fetch('SELECT chat_id FROM groups_seen ORDER BY chat_id')
         return [int(r['chat_id']) for r in rows]
 
     async def upsert_learned(self, scope_type: str, scope_id: int, trigger_norm: str, trigger_raw: str, response: str, created_by: int | None) -> str:

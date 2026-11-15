@@ -2067,7 +2067,16 @@ class MegaBot:
                 await self.safe_send(chat_id, '⛔ دسترسی پنل ادمین نداری.')
             return
 
-        if data.startswith('adm:uhist:') or data.startswith('adm:ugroups:') or data.startswith('adm:uwarn:') or data.startswith('adm:uwarnlv:') or data.startswith('adm:target:'):
+        if (
+            data.startswith('adm:uhist:')
+            or data.startswith('adm:ugroups:')
+            or data.startswith('adm:uwarn:')
+            or data.startswith('adm:uwarnlv:')
+            or data.startswith('adm:uwarngo:')
+        ):
+            await self.handle_user_search_extra(uid, chat_id, message_id, data)
+            return
+        if data.startswith('adm:target:'):
             await self.handle_target_select(uid, chat_id, message_id, data)
             return
 
@@ -5138,15 +5147,46 @@ class MegaBot:
     async def handle_target_select(self, uid: int, chat_id: int, message_id: int, data: str) -> None:
         if uid != OWNER_ID and not await self.db.is_admin(uid):
             return await self.safe_send(chat_id, '⛔ دسترسی مدیریت نداری.')
-        _, _, target_type, target_id = data.split(':', 3)
-        target_id = int(target_id)
+        parts = data.split(':')
+        if len(parts) < 4 or parts[0] != 'adm' or parts[1] != 'target':
+            return
+        target_type = parts[2]
+        if target_type not in ('user', 'group'):
+            log.warning('handle_target_select ignored bad data=%r', data[:80])
+            return
+        try:
+            target_id = int(parts[3])
+        except ValueError:
+            return
+        if target_id == 0:
+            await self.safe_edit(chat_id, message_id, '❌ شناسه نامعتبر است.', None)
+            return
         if not await self.has_perm(uid, 'search'):
             return await self.safe_send(chat_id, '⛔ مجوز جست‌وجو نداری.')
         rows = await self.db.search_target(str(target_id), target_type)
         target = rows[0] if rows else {'id': target_id, 'name': str(target_id), 'username': None}
+        if target_type == 'group':
+            try:
+                info = await self.api.get_chat(int(target_id))
+                if isinstance(info, dict):
+                    if not target.get('name') or str(target.get('name')) in ('0', 'None'):
+                        target['name'] = info.get('title') or info.get('first_name') or target.get('name')
+                    if not target.get('username'):
+                        target['username'] = info.get('username')
+            except Exception:
+                pass
         can_ban = await self.has_perm(uid, 'ban_user' if target_type == 'user' else 'ban_group')
-        text = f"*جزئیات {'کاربر' if target_type == 'user' else 'گروه'}*\nنام: {target.get('name') or 'نامشخص'}\nشناسه: `{target_id}`\nآیدی: @{target.get('username') or 'ندارد'}"
-        await self.safe_edit(chat_id, message_id, text, user_actions(target_type, target_id, can_ban))
+        nm = target.get('name') or 'نامشخص'
+        if str(nm) in ('0', 'None'):
+            nm = 'نامشخص'
+        un = target.get('username') or 'ندارد'
+        text = chr(10).join([
+            f"جزئیات {'کاربر' if target_type == 'user' else 'گروه'}",
+            f'نام: {nm}',
+            f'شناسه: `{target_id}`',
+            f'آیدی: @{un}',
+        ])
+        await self.safe_edit(chat_id, message_id, text, user_actions(target_type, target_id, can_ban), parse_mode=None)
 
     async def handle_moderation_callback(self, uid: int, chat_id: int, message_id: int, data: str) -> None:
         _, action, target_type, target_id = data.split(':',3)

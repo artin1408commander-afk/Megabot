@@ -7299,13 +7299,9 @@ class MegaBot:
             except Exception:
                 log.exception('add_warn failed')
             if deleted:
-                note = f'⚠️ پیام حذف شد.
-علت: «{reason}»
-اخطار: {warns}/{limit}'
+                note = '⚠️ پیام حذف شد.' + chr(10) + f'علت: «{reason}»' + chr(10) + f'اخطار: {warns}/{limit}'
             else:
-                note = f'❌ حذف پیام ممکن نشد.
-علت: «{reason}»
-اخطار: {warns}/{limit}'
+                note = '❌ حذف پیام ممکن نشد.' + chr(10) + f'علت: «{reason}»' + chr(10) + f'اخطار: {warns}/{limit}'
             try:
                 await self.msg.send_event(chat_id, 'lock_hit', note, parse_mode=None)
             except Exception:

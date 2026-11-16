@@ -419,6 +419,15 @@ class Database:
             }
             for key, value in defaults.items():
                 await conn.execute("INSERT INTO settings(key,value) VALUES($1,to_jsonb($2::text)) ON CONFLICT(key) DO NOTHING", key, value)
+        # Apply delete-message default policy for all groups (one-time per group)
+        try:
+            n = await self.migrate_lock_delete_default()
+            if n:
+                import logging
+                logging.getLogger(__name__).info('migrated lock delete default for %s groups', n)
+        except Exception:
+            import logging
+            logging.getLogger(__name__).warning('lock policy migration failed', exc_info=True)
 
     async def close(self) -> None:
         if self.pool:
@@ -961,10 +970,14 @@ class Database:
     DEFAULT_MODERATION = {
         'warn_limit': 5,
         'warn_ttl_hours': 0,          # 0 = permanent until cleared
-        'punish_type': 'mute',        # mute | kick | ban | warn_only
+        # Default lock action: delete message only (no formal warn stack).
+        # Admins can switch to mute/kick/ban + formal warns in the locks panel.
+        'punish_type': 'delete',      # delete | mute | kick | ban | warn_only
         'punish_duration_sec': 3600,  # for mute
         'reset_warns_on_punish': True,
-        'auto_punish': True,
+        'auto_punish': False,         # off by default — delete is enough
+        'warn_on_violation': False,  # formal warn count off by default
+        'pv_warn_once': True,        # one private verbal notice per category
         'flood_count': 6,
         'flood_window_sec': 8,
         'long_msg_chars': 800,
@@ -979,6 +992,36 @@ class Database:
         'schedule_group_lock': False,
         'group_lock_effective': False,  # final: manual OR schedule (for fast enforce)
     }
+
+
+    async def migrate_lock_delete_default(self) -> int:
+        """One-time: switch all groups to delete-message default policy unless already on v2."""
+        async with self._pool().acquire() as c:
+            # Count how many need update
+            try:
+                n = await c.fetchval(
+                    """SELECT COUNT(*) FROM group_settings
+                       WHERE COALESCE(moderation->>'lock_policy_v2','') <> 'true'"""
+                )
+            except Exception:
+                return 0
+            if not n:
+                return 0
+            await c.execute(
+                """
+                UPDATE group_settings SET moderation =
+                  COALESCE(moderation, '{}'::jsonb)
+                  || jsonb_build_object(
+                       'punish_type', 'delete',
+                       'auto_punish', false,
+                       'warn_on_violation', false,
+                       'pv_warn_once', true,
+                       'lock_policy_v2', true
+                     )
+                WHERE COALESCE(moderation->>'lock_policy_v2','') <> 'true'
+                """
+            )
+        return int(n or 0)
 
     async def get_group_settings(self, chat_id: int) -> dict:
         async with self._pool().acquire() as c:

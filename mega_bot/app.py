@@ -7231,7 +7231,7 @@ class MegaBot:
         if not reason:
             return False
 
-        # Delete first
+        # 1) Always delete violating message first
         deleted = False
         if mid:
             try:
@@ -7244,33 +7244,95 @@ class MegaBot:
             except Exception as exc:
                 log.info('security delete failed chat=%s: %s', chat_id, type(exc).__name__)
 
-        # Expire old warns if TTL configured
-        ttl_h = int(mod.get('warn_ttl_hours') or 0)
-        if ttl_h > 0:
-            try:
-                await self.db.expire_warns(chat_id, ttl_h)
-            except Exception:
-                pass
+        ptype = (mod.get('punish_type') or 'delete').lower()
+        # Formal warn stack only when enabled / escalated policy
+        if ptype == 'delete':
+            warn_on = bool(mod.get('warn_on_violation', False))
+        else:
+            warn_on = bool(mod.get('warn_on_violation', False)) or ptype in ('mute', 'kick', 'ban', 'warn_only')
+        pv_once = mod.get('pv_warn_once', True)
+        if pv_once is None:
+            pv_once = True
 
-        warns = await self.db.add_warn(chat_id, uid, reason=reason, message_id=int(mid) if mid else None)
+        # 2) One private verbal notice per category (not a formal warn)
+        if pv_once:
+            cat_key = f'lockpv:{chat_id}:{uid}:{reason}'
+            if not self.game_cache.get(cat_key):
+                self.game_cache[cat_key] = time.time()
+                try:
+                    gtitle = ''
+                    try:
+                        info = await self.api.get_chat(chat_id)
+                        if isinstance(info, dict):
+                            gtitle = (info.get('title') or '')[:40]
+                    except Exception:
+                        pass
+                    place = f'گروه «{gtitle}»' if gtitle else 'گروه'
+                    await self.safe_send(
+                        int(uid),
+                        chr(10).join([
+                            '⚠️ هشدار از سیستم قفل مگا',
+                            f'پیام شما در {place} به‌خاطر «{reason}» حذف شد.',
+                            'لطفاً قوانین گروه را رعایت کنید.',
+                            'این یک اخطار رسمی شمارشی نیست؛ فقط یادآوری است.',
+                        ]),
+                        parse_mode=None,
+                        permanent=True,
+                        skip_ad=True,
+                    )
+                except Exception:
+                    log.debug('pv lock notice failed uid=%s', uid)
+
+        warns = 0
         limit = int(mod.get('warn_limit') or gs.get('warn_limit') or 5)
 
-        if deleted:
-            note = f'⚠️ پیام متخلف حذف شد و یک اخطار ثبت شد.\nعلت: «{reason}»\nاخطار: {warns}/{limit}'
+        # 3) Formal warns only when admin enabled them
+        if warn_on:
+            ttl_h = int(mod.get('warn_ttl_hours') or 0)
+            if ttl_h > 0:
+                try:
+                    await self.db.expire_warns(chat_id, ttl_h)
+                except Exception:
+                    pass
+            try:
+                warns = await self.db.add_warn(chat_id, uid, reason=reason, message_id=int(mid) if mid else None)
+            except Exception:
+                log.exception('add_warn failed')
+            if deleted:
+                note = f'⚠️ پیام حذف شد.
+علت: «{reason}»
+اخطار: {warns}/{limit}'
+            else:
+                note = f'❌ حذف پیام ممکن نشد.
+علت: «{reason}»
+اخطار: {warns}/{limit}'
+            try:
+                await self.msg.send_event(chat_id, 'lock_hit', note, parse_mode=None)
+            except Exception:
+                try:
+                    await self.safe_send(chat_id, note, parse_mode=None)
+                except Exception:
+                    pass
         else:
-            note = (
-                f'❌ ربات اجازه حذف پیام را ندارد. لطفاً دسترسی‌های مدیریتی ربات را بررسی کنید.\n'
-                f'علت شناسایی‌شده: «{reason}»\nاخطار: {warns}/{limit}'
-            )
-        await self.safe_send(chat_id, note, parse_mode=None)
+            if not deleted:
+                try:
+                    await self.safe_send(
+                        chat_id,
+                        f'❌ ربات نتوانست پیام متخلف را حذف کند (علت: {reason}). دسترسی حذف پیام را بررسی کنید.',
+                        parse_mode=None,
+                    )
+                except Exception:
+                    pass
+
         try:
             await self.db.log(0, 'security_action', 'user', uid, {
-                'chat_id': chat_id, 'reason': reason, 'deleted': deleted, 'warns': warns,
+                'chat_id': chat_id, 'reason': reason, 'deleted': deleted,
+                'warns': warns, 'punish_type': ptype, 'warn_on': warn_on,
             })
         except Exception:
             pass
 
-        if warns >= limit and mod.get('auto_punish', True):
+        if warn_on and warns >= limit and mod.get('auto_punish', False) and ptype not in ('delete', 'warn_only'):
             await self._execute_auto_punish(chat_id, uid, warns, mod)
         return True
 
@@ -7305,7 +7367,9 @@ class MegaBot:
 
     async def _execute_auto_punish(self, chat_id: int, uid: int, warns: int, mod: dict) -> None:
         """Apply configured punishment once when warn threshold is reached."""
-        ptype = (mod.get('punish_type') or 'mute').lower()
+        ptype = (mod.get('punish_type') or 'delete').lower()
+        if ptype in ('delete', 'warn_only'):
+            return
         duration = int(mod.get('punish_duration_sec') or 3600)
         success = False
         detail = ''
@@ -7927,9 +7991,20 @@ class MegaBot:
             return
         if data.startswith('lock:ptype:'):
             ptype = data.rsplit(':', 1)[1]
-            if ptype not in ('mute', 'kick', 'ban', 'warn_only'):
+            if ptype not in ('delete', 'mute', 'kick', 'ban', 'warn_only'):
                 return
-            await self.db.update_moderation(chat_id, punish_type=ptype)
+            patch = {'punish_type': ptype}
+            if ptype == 'delete':
+                patch['warn_on_violation'] = False
+                patch['auto_punish'] = False
+                patch['pv_warn_once'] = True
+            elif ptype in ('mute', 'kick', 'ban'):
+                patch['warn_on_violation'] = True
+                patch['auto_punish'] = True
+            elif ptype == 'warn_only':
+                patch['warn_on_violation'] = True
+                patch['auto_punish'] = False
+            await self.db.update_moderation(chat_id, **patch)
             await self._show_punish_config(chat_id, message_id)
             return
         if data.startswith('lock:pdur:'):
@@ -7953,6 +8028,18 @@ class MegaBot:
             gs = await self.db.get_group_settings(chat_id)
             mod = gs.get('moderation') or {}
             await self.db.update_moderation(chat_id, reset_warns_on_punish=not mod.get('reset_warns_on_punish', True))
+            await self._show_punish_config(chat_id, message_id)
+            return
+        if data == 'lock:toggle_warnon':
+            gs = await self.db.get_group_settings(chat_id)
+            mod = gs.get('moderation') or {}
+            await self.db.update_moderation(chat_id, warn_on_violation=not bool(mod.get('warn_on_violation', False)))
+            await self._show_punish_config(chat_id, message_id)
+            return
+        if data == 'lock:toggle_pvonce':
+            gs = await self.db.get_group_settings(chat_id)
+            mod = gs.get('moderation') or {}
+            await self.db.update_moderation(chat_id, pv_warn_once=not bool(mod.get('pv_warn_once', True)))
             await self._show_punish_config(chat_id, message_id)
             return
         if data == 'grp:welcome_toggle' or data == 'wel:toggle':
@@ -9029,27 +9116,39 @@ class MegaBot:
     async def _show_punish_config(self, chat_id: int, message_id: int) -> None:
         gs = await self.db.get_group_settings(chat_id)
         mod = gs.get('moderation') or {}
-        ptype = mod.get('punish_type', 'mute')
+        ptype = mod.get('punish_type', 'delete')
         dur = int(mod.get('punish_duration_sec') or 3600)
-        auto = '🟢' if mod.get('auto_punish', True) else '🔴'
+        auto = '🟢' if mod.get('auto_punish', False) else '🔴'
         reset = '🟢' if mod.get('reset_warns_on_punish', True) else '🔴'
-        text = (
-            f"⚖️ *تنظیم مجازات*\n"
-            f"نوع فعلی: *{ptype}*\n"
-            f"مدت سکوت: *{max(1, dur // 60)} دقیقه*\n"
-            f"مجازات خودکار: {auto}\n"
-            f"صفر شدن اخطار بعد مجازات: {reset}\n\n"
-            f"نکته: Kick = اخراج موقت (می‌تواند دوباره عضو شود). Ban = مسدود دائمی."
-        )
+        warn_on = '🟢' if mod.get('warn_on_violation', False) else '🔴'
+        pv = '🟢' if mod.get('pv_warn_once', True) else '🔴'
+        ptype_fa = {
+            'delete': 'حذف پیام', 'mute': 'سکوت', 'kick': 'اخراج',
+            'ban': 'مسدود', 'warn_only': 'فقط اخطار',
+        }.get(ptype, ptype)
+        text = chr(10).join([
+            '⚖️ تنظیم مجازات',
+            f'نوع فعلی: {ptype_fa}',
+            f'مدت سکوت: {max(1, dur // 60)} دقیقه',
+            f'اخطار رسمی شمارشی: {warn_on}',
+            f'هشدار یک‌بار در پیوی: {pv}',
+            f'مجازات خودکار بعد از آستانه: {auto}',
+            f'صفر شدن اخطار بعد مجازات: {reset}',
+            '',
+            'پیش‌فرض مگا: فقط حذف پیام + یک هشدار خصوصی.',
+            'در صورت نیاز می‌توانی اخطار رسمی و سکوت/بن را فعال کنی.',
+        ])
         kb = inline([
+            [('🗑 فقط حذف پیام', 'lock:ptype:delete', STYLE_SUCCESS)],
             [('🤐 سکوت', 'lock:ptype:mute'), ('👢 اخراج', 'lock:ptype:kick')],
             [('⛔ مسدود', 'lock:ptype:ban'), ('⚠️ فقط اخطار', 'lock:ptype:warn_only')],
             [('۱۰د', 'lock:pdur:600'), ('۳۰د', 'lock:pdur:1800'), ('۱س', 'lock:pdur:3600'), ('۲۴س', 'lock:pdur:86400')],
-            [('🔗 جوین اجباری گروه', 'fj:panel')],
+            [(f'{warn_on} اخطار رسمی', 'lock:toggle_warnon'), (f'{pv} هشدار پیوی', 'lock:toggle_pvonce')],
             [(f'{auto} مجازات خودکار', 'lock:toggle_auto'), (f'{reset} صفر اخطار', 'lock:toggle_reset')],
+            [('🔗 جوین اجباری گروه', 'fj:panel')],
             [('🔙 بازگشت به قفل‌ها', 'lock:panel'), ('✖️ بستن', 'close')],
         ])
-        await self.safe_edit(chat_id, message_id, text, kb)
+        await self.safe_edit(chat_id, message_id, text, kb, parse_mode=None)
 
     async def _show_lock_stats(self, chat_id: int, message_id: int) -> None:
         try:

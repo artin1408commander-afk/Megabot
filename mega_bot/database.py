@@ -637,20 +637,25 @@ class Database:
                    WHERE first_at >= date_trunc('day', NOW() AT TIME ZONE 'Asia/Tehran')"""
             ) or 0)
 
-            # Active this month — private chat activity only
+            # Active this month (PV): must be a real /start user AND private activity this month.
+            # Never exceed total PV /start count.
             active_month_pv = int(await c.fetchval(
-                """SELECT COUNT(DISTINCT user_id) FROM usage_events
-                   WHERE user_id IS NOT NULL
-                     AND chat_type = 'private'
-                     AND created_at >= date_trunc('month', NOW() AT TIME ZONE 'Asia/Tehran')"""
+                """SELECT COUNT(DISTINCT e.user_id)
+                   FROM usage_events e
+                   INNER JOIN user_private_first p ON p.user_id = e.user_id
+                   WHERE e.user_id IS NOT NULL
+                     AND e.chat_type = 'private'
+                     AND e.created_at >= date_trunc('month', NOW() AT TIME ZONE 'Asia/Tehran')"""
             ) or 0)
-            if active_month_pv == 0:
-                # Fallback: private-first users who were last_seen this month
-                active_month_pv = int(await c.fetchval(
-                    """SELECT COUNT(*) FROM users u
-                       INNER JOIN user_private_first p ON p.user_id = u.user_id
-                       WHERE u.last_seen >= date_trunc('month', NOW() AT TIME ZONE 'Asia/Tehran')"""
-                ) or 0)
+            # Users who /start'd this month count as active even without extra events
+            started_month = int(await c.fetchval(
+                """SELECT COUNT(*) FROM user_private_first
+                   WHERE first_at >= date_trunc('month', NOW() AT TIME ZONE 'Asia/Tehran')"""
+            ) or 0)
+            if started_month > active_month_pv:
+                active_month_pv = started_month
+            if active_month_pv > users_pv_start:
+                active_month_pv = users_pv_start
 
             groups_registered = int(await c.fetchval(
                 "SELECT COUNT(*) FROM groups_seen WHERE COALESCE(bot_status, 'member') NOT IN ('left', 'kicked')"
@@ -895,11 +900,30 @@ class Database:
             await c.execute('UPDATE donations SET broadcast_sent=$2,broadcast_failed=$3 WHERE id=$1', donation_id, sent, failed)
 
     async def record_usage(self, user_id: int | None, chat: dict, event_type: str = 'message') -> None:
-        chat_type = chat.get('type') or 'private'
+        raw_type = (chat.get('type') or '').strip().lower()
+        cid = int(chat.get('id') or 0)
+        if raw_type in ('private', 'pv', 'user'):
+            chat_type = 'private'
+        elif raw_type in ('group', 'supergroup', 'megagroup', 'channel', 'broadcast'):
+            chat_type = 'group' if raw_type != 'channel' else 'channel'
+        else:
+            # Bale often omits type; never assume private for unknown group-like chats
+            if cid < 0:
+                chat_type = 'group'
+            elif user_id and cid == int(user_id):
+                chat_type = 'private'
+            else:
+                chat_type = raw_type or 'unknown'
         async with self._pool().acquire() as c:
-            await c.execute('INSERT INTO usage_events(user_id,chat_id,chat_type,event_type) VALUES($1,$2,$3,$4)', user_id, int(chat['id']), chat_type, event_type)
-            if chat_type in ('group','supergroup'):
-                await c.execute('UPDATE groups_seen SET messages_count=messages_count+1,last_seen=NOW() WHERE chat_id=$1', int(chat['id']))
+            await c.execute(
+                'INSERT INTO usage_events(user_id,chat_id,chat_type,event_type) VALUES($1,$2,$3,$4)',
+                user_id, cid, chat_type, event_type,
+            )
+            if chat_type in ('group', 'supergroup', 'channel'):
+                await c.execute(
+                    'UPDATE groups_seen SET messages_count=messages_count+1,last_seen=NOW() WHERE chat_id=$1',
+                    cid,
+                )
 
     async def create_case(self, target_type: str, target_id: int, username: str | None, name: str, reason: str, days: int | None, permanent: bool, actor: int) -> dict:
         from datetime import timedelta

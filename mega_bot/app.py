@@ -825,11 +825,14 @@ class MegaBot:
         except Exception:
             log.warning('upsert_user skipped/failed for %s', uid)
         # تبریک عضو جدید فقط برای اولین پیام در پیوی (نه گروه)
-        if uid and uid != OWNER_ID and not is_group and self._is_private_chat_id(chat_id):
+        if uid and not is_group and self._is_private_chat_id(chat_id):
             try:
-                first_pv = await self.db.claim_first_private(uid)
-                if first_pv:
-                    asyncio.create_task(self._notify_owner_new_user(user, source='private'))
+                if uid != OWNER_ID:
+                    first_pv = await self.db.claim_first_private(uid)
+                    if first_pv:
+                        asyncio.create_task(self._notify_owner_new_user(user, source='private'))
+                        if not (text or '').startswith('/start'):
+                            asyncio.create_task(self._send_onboarding_sequence(chat_id, user))
             except Exception:
                 log.debug('first-private claim failed', exc_info=True)
 
@@ -1050,13 +1053,33 @@ class MegaBot:
                     )
                 return
 
-        if text.startswith('/start'):
-            await self.safe_send(chat_id, '*سلام؛ به MEGA BOT خوش آمدی* 🌑\nاز کیبورد پایین، بخش موردنظرت را انتخاب کن.', USER_KEYBOARD)
+        if text.startswith('/start') or (not is_group and text in ('استارت', 'start')):
             if not is_group:
+                show_onboard = (uid == OWNER_ID)
+                if not show_onboard:
+                    try:
+                        show_onboard = await self.db.claim_first_private(uid)
+                    except Exception:
+                        show_onboard = False
+                if show_onboard:
+                    asyncio.create_task(self._send_onboarding_sequence(chat_id, user))
+                else:
+                    await self.safe_send(
+                        chat_id,
+                        'سلام؛ دوباره خوش اومدی 🌑' + chr(10) + 'از کیبورد پایین بخش موردنظرت را انتخاب کن.',
+                        USER_KEYBOARD,
+                        parse_mode=None,
+                    )
                 try:
                     await self._deliver_pending_hafez_dm(chat_id, uid)
                 except Exception:
                     log.debug('pending hafez dm failed', exc_info=True)
+            else:
+                await self.safe_send(
+                    chat_id,
+                    'سلام؛ من MEGA BOT هستم 🌑 برای منوی کامل در پیوی ربات /start بزن.',
+                    parse_mode=None,
+                )
             return
         if text.startswith('/admin'):
             if uid != OWNER_ID and not await self.db.is_admin(uid):
@@ -1687,6 +1710,16 @@ class MegaBot:
         self, uid: int, chat_id: int, message_id: int, data: str,
         user: dict, chat: dict, query: dict,
     ) -> None:
+        if data == 'onboard:ack':
+            try:
+                await self.api.delete_message(chat_id, int(message_id))
+            except Exception:
+                try:
+                    await self.safe_edit(chat_id, message_id, '✅ متوجه شدی. موفق باشی!', None, parse_mode=None)
+                except Exception:
+                    pass
+            return
+
         # ── Force join callbacks ──
         if data == 'own:fj':
             if uid != OWNER_ID:
@@ -3842,7 +3875,7 @@ class MegaBot:
         users = s.get('users', 0)
         new_today = s.get('new_today', 0)
         new_month = s.get('new_month', 0)
-        active_month = s.get('active_month', 0)
+        active_month = s.get('active_month_pv', s.get('active_month', 0))
         groups = s.get('groups_registered', s.get('groups', 0))
         banned_u = s.get('banned_users', 0)
         banned_g = s.get('banned_groups', 0)
@@ -3850,19 +3883,17 @@ class MegaBot:
         return (
             '*📊 مرکز اطلاعات مگا*'
             + chr(10) + '━━━━━━━━━━━━━━━━━━'
-            + chr(10) + f'*👤 کاربران (کل):* {users}'
-            + chr(10) + f'*🆕 کاربران جدید امروز:* {new_today}'
+            + chr(10) + f'*👤 کاربران (کل پیوی + گروه):* {users}'
+            + chr(10) + f'*🆕 کاربران جدید (تا ۳ روز):* {new_today}'
             + chr(10) + f'*📅 کاربران جدید این ماه:* {new_month}'
-            + chr(10) + f'*⚡ فعال این ماه:* {active_month}'
-            + chr(10) + f'*👥 گروه‌های ثبت‌شده:* {groups}'
+            + chr(10) + f'*⚡ فعال این ماه (فقط پیوی):* {active_month}'
+            + chr(10) + f'*👥 گروه‌های ثبت‌شده (واقعی):* {groups}'
             + chr(10) + f'*⛔ محدودیت فعال کاربران:* {banned_u}'
             + chr(10) + f'*🚫 گروه‌های محدود:* {banned_g}'
-            + chr(10) + f'*💚 مجموع حمایت مالی:* {donations} تومان'
+            + chr(10) + f'*💚 مجموع حمایت مالی:* {donations:,} تومان'
             + chr(10) + '━━━━━━━━━━━━━━━━━━'
             + chr(10) + f'*ℹ️ نسخه {BOT_VERSION}*'
         )
-
-
 
 
     def _is_xp_spam(self, chat_id: int, user_id: int) -> bool:

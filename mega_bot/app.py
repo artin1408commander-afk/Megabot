@@ -825,16 +825,8 @@ class MegaBot:
         except Exception:
             log.warning('upsert_user skipped/failed for %s', uid)
         # تبریک عضو جدید فقط برای اولین پیام در پیوی (نه گروه)
-        if uid and not is_group and self._is_private_chat_id(chat_id):
-            try:
-                if uid != OWNER_ID:
-                    first_pv = await self.db.claim_first_private(uid)
-                    if first_pv:
-                        asyncio.create_task(self._notify_owner_new_user(user, source='private'))
-                        if not (text or '').startswith('/start'):
-                            asyncio.create_task(self._send_onboarding_sequence(chat_id, user))
-            except Exception:
-                log.debug('first-private claim failed', exc_info=True)
+        # First-private /start onboarding is handled in the /start branch below.
+        # Do not claim_first_private here — it would steal the "first start" flag.
 
 
                 # ── Maintenance mode (owner can toggle): block all non-owner interaction
@@ -1053,22 +1045,39 @@ class MegaBot:
                     )
                 return
 
-        if text.startswith('/start') or (not is_group and text in ('استارت', 'start')):
+        if text.startswith('/start') or (not is_group and text.strip() in ('استارت', 'start', '/استارت')):
             if not is_group:
                 first_start = False
                 try:
                     first_start = await self.db.record_private_start(uid)
                 except Exception:
-                    log.debug('record_private_start failed', exc_info=True)
-                show_onboard = (uid == OWNER_ID) or first_start
+                    log.exception('record_private_start failed')
+                    first_start = False
+                show_onboard = (uid == OWNER_ID) or bool(first_start)
                 if show_onboard:
-                    asyncio.create_task(self._send_onboarding_sequence(chat_id, user))
+                    if uid != OWNER_ID and first_start:
+                        try:
+                            asyncio.create_task(self._notify_owner_new_user(user, source='private'))
+                        except Exception:
+                            pass
+                    try:
+                        await self._send_onboarding_sequence(chat_id, user)
+                    except Exception:
+                        log.exception('onboarding failed')
+                        await self.safe_send(
+                            chat_id,
+                            'سلام! به مگا بات خوش اومدی 🌑' + chr(10) + 'از کیبورد پایین شروع کن.',
+                            USER_KEYBOARD,
+                            parse_mode=None,
+                            permanent=True,
+                        )
                 else:
                     await self.safe_send(
                         chat_id,
                         'سلام؛ دوباره خوش اومدی 🌑' + chr(10) + 'از کیبورد پایین بخش موردنظرت را انتخاب کن.',
                         USER_KEYBOARD,
                         parse_mode=None,
+                        permanent=True,
                     )
                 try:
                     await self._deliver_pending_hafez_dm(chat_id, uid)
@@ -8946,6 +8955,10 @@ class MegaBot:
         """Block bot feature usage until user joined all global force-join targets.
         Returns True if message was consumed (blocked)."""
         if not uid or uid == OWNER_ID:
+            return False
+        # Never block /start — onboarding and keyboard must always work in PV
+        t0 = (text or '').strip().lower()
+        if t0.startswith('/start') or t0 in ('start', 'استارت', '/استارت'):
             return False
         try:
             if await self.db.is_admin(uid):

@@ -449,6 +449,28 @@ class Database:
             await c.execute('DELETE FROM users')
         return int(n or 0)
 
+
+    async def record_private_start(self, user_id: int) -> bool:
+        """Mark /start in private. Returns True if this is the first private start."""
+        if not user_id:
+            return False
+        async with self._pool().acquire() as c:
+            row = await c.fetchrow(
+                """INSERT INTO user_private_first(user_id) VALUES($1)
+                   ON CONFLICT (user_id) DO NOTHING
+                   RETURNING user_id""",
+                int(user_id),
+            )
+            first = bool(row)
+            await c.execute(
+                """INSERT INTO users(user_id, starts_count) VALUES($1, 1)
+                   ON CONFLICT(user_id) DO UPDATE SET
+                     starts_count = users.starts_count + 1,
+                     last_seen = NOW()""",
+                int(user_id),
+            )
+        return first
+
     async def claim_first_private(self, user_id: int) -> bool:
         """True only the first time this user talks in private with the bot."""
         if not user_id:
@@ -610,17 +632,15 @@ class Database:
                    ) t"""
             ) or 0)
 
-            # «جدید» = اولین تماس پیوی در ۳ روز اخیر
+            # «کاربران جدید» = همه کسانی که تا الآن حداقل یک‌بار در پیوی /start زده‌اند
+            # (جدول user_private_first + starts_count در users)
             new_today = int(await c.fetchval(
-                """SELECT COUNT(*) FROM user_private_first
-                   WHERE first_at >= NOW() - INTERVAL '3 days'"""
+                """SELECT COUNT(*) FROM user_private_first"""
             ) or 0)
-            # also count users whose first_seen is recent and only seen in private
-            new_today_users = int(await c.fetchval(
-                """SELECT COUNT(*) FROM users
-                   WHERE first_seen >= NOW() - INTERVAL '3 days'"""
+            started_users = int(await c.fetchval(
+                """SELECT COUNT(*) FROM users WHERE COALESCE(starts_count, 0) > 0"""
             ) or 0)
-            new_today = max(new_today, new_today_users)
+            new_today = max(new_today, started_users)
 
             # New this month = first PV contact this Tehran month
             new_month = int(await c.fetchval(

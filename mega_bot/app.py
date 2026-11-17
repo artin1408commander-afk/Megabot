@@ -1055,12 +1055,12 @@ class MegaBot:
 
         if text.startswith('/start') or (not is_group and text in ('استارت', 'start')):
             if not is_group:
-                show_onboard = (uid == OWNER_ID)
-                if not show_onboard:
-                    try:
-                        show_onboard = await self.db.claim_first_private(uid)
-                    except Exception:
-                        show_onboard = False
+                first_start = False
+                try:
+                    first_start = await self.db.record_private_start(uid)
+                except Exception:
+                    log.debug('record_private_start failed', exc_info=True)
+                show_onboard = (uid == OWNER_ID) or first_start
                 if show_onboard:
                     asyncio.create_task(self._send_onboarding_sequence(chat_id, user))
                 else:
@@ -3884,7 +3884,7 @@ class MegaBot:
             '*📊 مرکز اطلاعات مگا*'
             + chr(10) + '━━━━━━━━━━━━━━━━━━'
             + chr(10) + f'*👤 کاربران (کل پیوی + گروه):* {users}'
-            + chr(10) + f'*🆕 کاربران جدید (تا ۳ روز):* {new_today}'
+            + chr(10) + f'*🆕 کاربران جدید (استارت پیوی):* {new_today}'
             + chr(10) + f'*📅 کاربران جدید این ماه:* {new_month}'
             + chr(10) + f'*⚡ فعال این ماه (فقط پیوی):* {active_month}'
             + chr(10) + f'*👥 گروه‌های ثبت‌شده (واقعی):* {groups}'

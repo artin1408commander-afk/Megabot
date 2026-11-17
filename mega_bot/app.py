@@ -3882,6 +3882,7 @@ class MegaBot:
 
     def stats_text(self, s: dict) -> str:
         users = s.get('users', 0)
+        users_pv = s.get('users_pv_start', s.get('users_pv', 0))
         new_today = s.get('new_today', 0)
         new_month = s.get('new_month', 0)
         active_month = s.get('active_month_pv', s.get('active_month', 0))
@@ -3893,8 +3894,9 @@ class MegaBot:
             '*📊 مرکز اطلاعات مگا*'
             + chr(10) + '━━━━━━━━━━━━━━━━━━'
             + chr(10) + f'*👤 کاربران (کل پیوی + گروه):* {users}'
-            + chr(10) + f'*🆕 کاربران جدید (استارت پیوی):* {new_today}'
-            + chr(10) + f'*📅 کاربران جدید این ماه:* {new_month}'
+            + chr(10) + f'*💬 کاربران کل (پیوی /start):* {users_pv}'
+            + chr(10) + f'*🆕 استارت پیوی امروز:* {new_today}'
+            + chr(10) + f'*📅 کاربران جدید این ماه (پیوی):* {new_month}'
             + chr(10) + f'*⚡ فعال این ماه (فقط پیوی):* {active_month}'
             + chr(10) + f'*👥 گروه‌های ثبت‌شده (واقعی):* {groups}'
             + chr(10) + f'*⛔ محدودیت فعال کاربران:* {banned_u}'

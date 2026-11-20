@@ -5,3 +5,7 @@ __pycache__/
 venv/
 *.log
 .tmp/
+
+mega_bot/assets/piper/*.onnx
+mega_bot/assets/piper/*.onnx.json
+mega_bot/assets/piper/*.part

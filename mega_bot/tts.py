@@ -1,7 +1,7 @@
 """TTS for MEGA BOT.
 
 Persian (FA):
-  - short text (< PIPER_MAX_CHARS, default 30): Piper offline (Amir) if model available
+  - short text (< PIPER_MAX_CHARS, default 100): Piper offline (Amir) if model available
   - longer text: gTTS → Google HTTP → espeak-ng
 
 English / other:
@@ -32,12 +32,12 @@ GOOGLE_CHUNK = int(os.getenv('TTS_GOOGLE_CHUNK', '180'))
 GOOGLE_PARALLEL = int(os.getenv('TTS_GOOGLE_PARALLEL', '5'))
 
 # Short Persian → Piper; at/above this length → existing online engines
-PIPER_MAX_CHARS = int(os.getenv('TTS_PIPER_MAX_CHARS', '30'))
+PIPER_MAX_CHARS = int(os.getenv('TTS_PIPER_MAX_CHARS', '100'))
 # medium-low speed (higher length_scale = slower), soft/quiet voice
-PIPER_LENGTH_SCALE = float(os.getenv('TTS_PIPER_LENGTH_SCALE', '1.2'))
-PIPER_NOISE_SCALE = float(os.getenv('TTS_PIPER_NOISE_SCALE', '0.45'))
-PIPER_NOISE_W = float(os.getenv('TTS_PIPER_NOISE_W', '0.65'))
-PIPER_VOLUME = float(os.getenv('TTS_PIPER_VOLUME', '0.72'))
+PIPER_LENGTH_SCALE = float(os.getenv('TTS_PIPER_LENGTH_SCALE', '1.55'))
+PIPER_NOISE_SCALE = float(os.getenv('TTS_PIPER_NOISE_SCALE', '0.5'))
+PIPER_NOISE_W = float(os.getenv('TTS_PIPER_NOISE_W', '0.7'))
+PIPER_VOLUME = float(os.getenv('TTS_PIPER_VOLUME', '0.8'))
 PIPER_MODEL_ENV = os.getenv('PIPER_MODEL', '').strip()
 PIPER_MODEL_DIR = os.getenv(
     'PIPER_MODEL_DIR',
@@ -61,9 +61,24 @@ def _which(cmd: str) -> Optional[str]:
 def normalize_tts_text(text: str) -> str:
     t = (text or '').strip()
     t = t.replace('\r\n', '\n').replace('\r', '\n')
-    t = re.sub(r'[ \t]+', ' ', t)
+    # keep ZWNJ (\u200c) for Persian word joining; only collapse plain spaces
+    t = re.sub(r'[ \t\u00a0]+', ' ', t)
     t = re.sub(r'\n{3,}', '\n\n', t)
     return t.strip()
+
+
+def _prepare_piper_text(text: str) -> str:
+    """Help Piper finish words: light spacing + terminal pause marker."""
+    t = normalize_tts_text(text)
+    if not t:
+        return t
+    # ensure separation around common Persian punctuation
+    t = re.sub(r'\s*([،؛:!?…؟.])\s*', r'\1 ', t)
+    t = re.sub(r'\s+', ' ', t).strip()
+    # trailing pause so last syllable is not clipped
+    if t[-1] not in '،؛:!?…؟.':
+        t = t + '.'
+    return t
 
 
 def detect_lang(text: str) -> str:
@@ -210,6 +225,21 @@ def _load_piper_sync():
         return None
 
 
+def _pad_wav_silence(wav_path: str, ms: int = 350) -> None:
+    """Append silence so the last word is not cut off."""
+    import wave
+    import struct
+    with wave.open(wav_path, 'rb') as wf:
+        params = wf.getparams()
+        frames = wf.readframes(wf.getnframes())
+    nchan, sampwidth, rate = params.nchannels, params.sampwidth, params.framerate
+    n_sil = int(rate * (ms / 1000.0))
+    silence = b'\x00' * (n_sil * nchan * sampwidth)
+    with wave.open(wav_path, 'wb') as wf:
+        wf.setparams(params)
+        wf.writeframes(frames + silence)
+
+
 def _synthesize_piper_sync(text: str) -> bytes:
     voice = _load_piper_sync()
     if voice is None:
@@ -217,17 +247,25 @@ def _synthesize_piper_sync(text: str) -> bytes:
 
     import wave
 
+    text = _prepare_piper_text(text)
+
     with tempfile.TemporaryDirectory(prefix='mega-piper-') as td:
         wav_path = os.path.join(td, 'out.wav')
         syn_config = None
         try:
             from piper.config import SynthesisConfig  # type: ignore
-            syn_config = SynthesisConfig(
+            # length_scale > 1 => slower; sentence_silence adds gap between sentences
+            kwargs = dict(
                 length_scale=PIPER_LENGTH_SCALE,
                 noise_scale=PIPER_NOISE_SCALE,
                 noise_w=PIPER_NOISE_W,
                 volume=PIPER_VOLUME,
             )
+            # sentence_silence supported on newer piper-tts
+            try:
+                syn_config = SynthesisConfig(**kwargs, sentence_silence=0.35)
+            except TypeError:
+                syn_config = SynthesisConfig(**kwargs)
         except Exception:
             syn_config = None
 
@@ -250,7 +288,6 @@ def _synthesize_piper_sync(text: str) -> bytes:
                     log.warning('synthesize_wav failed: %s', exc)
                     ok = False
             if not ok:
-                # Older iterator API
                 rate = 22050
                 try:
                     rate = int(getattr(voice.config, 'sample_rate', 22050))
@@ -277,9 +314,15 @@ def _synthesize_piper_sync(text: str) -> bytes:
                     if audio:
                         wf.writeframes(audio)
 
+        try:
+            _pad_wav_silence(wav_path, ms=400)
+        except Exception as exc:
+            log.debug('pad silence failed: %s', exc)
+
         ogg_path = os.path.join(td, 'out.ogg')
         try:
-            _ffmpeg_to_ogg(wav_path, ogg_path, volume=0.85)
+            # mild volume reduce only; do not trim end
+            _ffmpeg_to_ogg(wav_path, ogg_path, volume=0.9)
             return open(ogg_path, 'rb').read()
         except Exception:
             return open(wav_path, 'rb').read()
@@ -393,7 +436,7 @@ async def synthesize_persian(text: str = DEFAULT_TEXT) -> tuple[bytes, str]:
     errors: list[str] = []
 
     # Persian short phrases → Piper (soft, medium-low speed)
-    if lang == 'fa' and len(text) < PIPER_MAX_CHARS:
+    if lang == 'fa' and len(text) <= PIPER_MAX_CHARS:
         try:
             data = await synthesize_piper(text)
             if data and len(data) > 50:

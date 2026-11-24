@@ -2624,7 +2624,8 @@ class MegaBot:
             log.debug('owner new-group notify failed', exc_info=True)
 
     async def _maybe_log_watch_mention(self, chat_id: int, uid: int, text: str, msg: dict) -> None:
-        """Silent brand/insult watch — log + notify owner; user must never see this."""
+        """Disabled: no violation/mention reports to owner PV."""
+        return
         if not uid or uid == OWNER_ID or not text:
             return
         hits = self._match_watch_terms(text)
@@ -2659,6 +2660,8 @@ class MegaBot:
     async def _notify_owner_watch(
         self, *, chat_id: int, uid: int, text: str, hits: list, insult: bool, msg: dict,
     ) -> None:
+        # Disabled — owner must not receive violation/mention spam
+        return
         if not OWNER_ID:
             return
         try:
@@ -5258,8 +5261,8 @@ class MegaBot:
             if not case:
                 await self.safe_edit(chat_id,message_id,'برای این مورد محدودیت فعالی ثبت نشده است.',inline([[('↩️ برگشت','admin:page:0'),('✖️ بستن','close')]])); return
             await self.safe_edit(chat_id,message_id,f"✅ محدودیت برداشته شد.\nکد پرونده: `#{case['case_code']}`",inline([[('↩️ برگشت','admin:page:0'),('✖️ بستن','close')]])); return
-        self.states[uid]={'step':'ban_reason','target_type':target_type,'target_id':target_id,'chat_id':chat_id,'message_id':message_id}
-        await self.safe_edit(chat_id,message_id,'دلیل محدودیت را بفرست.',inline([[('↩️ برگشت','admin:page:0'),('✖️ بستن','close')]]))
+        self.states[uid]={'step':'ban_duration','target_type':target_type,'target_id':target_id,'chat_id':chat_id,'message_id':message_id}
+        await self.safe_edit(chat_id,message_id,'🚫 بن کاربر\n\nچند روز بن باشد؟\nعدد روز را بفرست یا بنویس: دائم',inline([[('↩️ برگشت','admin:page:0'),('✖️ بستن','close')]]))
 
     # ─── Ad button system ───────────────────────────────────────────────
 
@@ -9589,42 +9592,128 @@ class MegaBot:
             d=state['team_data']; username='' if text=='-' else text.lstrip('@')
             await self.db.add_team_member(d['name'],d['title'],d['description'],username,uid)
             self.states.pop(uid,None); await self.safe_send(chat_id,'✅ عضو تیم اضافه شد.',inline([[('↩️ برگشت','own:team'),('✖️ بستن','close')]])); return True
-        if step == 'ban_reason':
-            state['reason']=text or 'دلیلی ثبت نشده'; state['step']='ban_duration'
-            await self.safe_send(chat_id,'مدت محدودیت رو به روز بفرست؛ برای دائمی بنویس `دائمی` و برای یک روز `1`.',inline([[('↩️ برگشت','admin:page:0'),('✖️ بستن','close')]])); return True
         if step == 'ban_duration':
-            permanent=text.strip() in ('دائمی','دائم','بی پایان','بی‌پایان','permanent','forever')
-            days=None
+            permanent = text.strip() in ('دائمی', 'دائم', 'بی پایان', 'بی‌پایان', 'permanent', 'forever')
+            days = None
             if not permanent:
-                match=re.search(r'\d+',text)
-                if not match or int(match.group())<1 or int(match.group())>36500:
-                    await self.safe_send(chat_id,'مدت باید تعداد روز مثبت یا «دائمی» باشد.'); return True
-                days=int(match.group())
-            target_type=state['target_type']; target_id=int(state['target_id'])
-            info=await self.db.search_target(str(target_id),target_type)
-            target=info[0] if info else {'id':target_id,'username':None,'name':str(target_id)}
-            case=await self.db.create_case(target_type,target_id,target.get('username'),target.get('name') or str(target_id),state.get('reason',''),days,permanent,uid)
-            self.states.pop(uid,None)
-            duration='دائمی' if permanent else f'{days} روز'
-            notice=f"*⛔ محدودیت MEGA BOT*\nدلیل: {case['reason']}\nمدت: {duration}\nکد پیگیری: `#{case['case_code']}`\nصادرکننده: `{uid}`"
-            # For group restriction, post and try to pin the notice. For user, DM is best-effort.
-            sent=None
-            if target_type=='group':
-                sent=await self.safe_send(target_id,notice)
+                match = re.search(r'\d+', text)
+                if not match or int(match.group()) < 1 or int(match.group()) > 36500:
+                    await self.safe_send(chat_id, 'مدت باید تعداد روز مثبت یا «دائم» باشد.')
+                    return True
+                days = int(match.group())
+            state['permanent'] = permanent
+            state['days'] = days
+            state['step'] = 'ban_package'
+            await self.safe_send(
+                chat_id,
+                'پکیج آن‌بن فعال باشد؟\nبنویس: بله یا خیر',
+                inline([[('↩️ برگشت', 'admin:page:0'), ('✖️ بستن', 'close')]]),
+            )
+            return True
+        if step == 'ban_package':
+            tlow = (text or '').strip().lower()
+            yes = tlow in ('بله', 'آره', 'اره', 'yes', 'y', '1', 'true')
+            no = tlow in ('خیر', 'نه', 'no', 'n', '0', 'false')
+            if not yes and not no:
+                await self.safe_send(chat_id, 'فقط بله یا خیر بنویس.')
+                return True
+            state['unban_package'] = yes
+            state['step'] = 'ban_reason'
+            await self.safe_send(
+                chat_id,
+                'دلیل بن را بنویس:',
+                inline([[('↩️ برگشت', 'admin:page:0'), ('✖️ بستن', 'close')]]),
+            )
+            return True
+        if step == 'ban_reason':
+            reason = (text or '').strip()
+            if len(reason) < 2:
+                await self.safe_send(chat_id, 'دلیل خیلی کوتاه است. دوباره بنویس.')
+                return True
+            state['reason'] = reason
+            state['step'] = 'ban_confirm'
+            duration = 'دائم' if state.get('permanent') else f"{state.get('days')} روز"
+            pkg = 'بله' if state.get('unban_package') else 'خیر'
+            summary = (
+                f"تأیید نهایی بن:\n"
+                f"هدف: {state.get('target_type')} `{state.get('target_id')}`\n"
+                f"مدت: {duration}\n"
+                f"پکیج آن‌بن: {pkg}\n"
+                f"دلیل: {reason}\n\n"
+                f"برای تأیید بنویس: تأیید\nبرای لغو: لغو"
+            )
+            await self.safe_send(
+                chat_id,
+                summary,
+                inline([[('↩️ برگشت', 'admin:page:0'), ('✖️ بستن', 'close')]]),
+                parse_mode=None,
+            )
+            return True
+        if step == 'ban_confirm':
+            tnorm = (text or '').strip()
+            if tnorm in ('لغو', 'cancel', 'انصراف'):
+                self.states.pop(uid, None)
+                await self.safe_send(chat_id, 'عملیات بن لغو شد.', inline([[('↩️ برگشت', 'admin:page:0'), ('✖️ بستن', 'close')]]))
+                return True
+            if tnorm not in ('تأیید', 'تایید', 'confirm', 'ok', 'بله'):
+                await self.safe_send(chat_id, 'برای تأیید بنویس «تأیید» یا برای لغو «لغو».')
+                return True
+            permanent = bool(state.get('permanent'))
+            days = state.get('days')
+            target_type = state['target_type']
+            target_id = int(state['target_id'])
+            info = await self.db.search_target(str(target_id), target_type)
+            target = info[0] if info else {'id': target_id, 'username': None, 'name': str(target_id)}
+            case = await self.db.create_case(
+                target_type,
+                target_id,
+                target.get('username'),
+                target.get('name') or str(target_id),
+                state.get('reason', ''),
+                days,
+                permanent,
+                uid,
+                unban_package=bool(state.get('unban_package')),
+            )
+            self.states.pop(uid, None)
+            duration = 'دائم' if permanent else f'{days} روز'
+            pkg = 'بله' if case.get('unban_package') or state.get('unban_package') else 'خیر'
+            notice = (
+                f"*⛔ محدودیت MEGA BOT*\n"
+                f"دلیل: {case['reason']}\n"
+                f"مدت: {duration}\n"
+                f"پکیج آن‌بن: {pkg}\n"
+                f"کد پیگیری: `#{case['case_code']}`\n"
+                f"صادرکننده: `{uid}`"
+            )
+            sent = None
+            if target_type == 'group':
+                sent = await self.safe_send(target_id, notice)
                 if sent:
-                    try: await self.api.pin_message(target_id,int(sent['message_id']))
-                    except Exception as exc: log.info('Could not pin group restriction notice: %s',exc)
-                # Best-effort owner notification; if the owner has never started the bot, Bale may reject the DM.
+                    try:
+                        await self.api.pin_message(target_id, int(sent['message_id']))
+                    except Exception as exc:
+                        log.info('Could not pin group restriction notice: %s', exc)
                 try:
-                    members=await self.api.call('getChatAdministrators', {'chat_id':target_id})
-                    creator=next((m.get('user') for m in (members or []) if m.get('status')=='creator' and m.get('user')),None)
+                    members = await self.api.call('getChatAdministrators', {'chat_id': target_id})
+                    creator = next(
+                        (m.get('user') for m in (members or []) if m.get('status') == 'creator' and m.get('user')),
+                        None,
+                    )
                     if creator:
-                        await self.safe_send(int(creator['id']), notice+'\n\nاین گروه در MEGA BOT محدود شده است.')
-                except Exception as exc:
-                    log.info('Could not notify group owner: %s',exc)
+                        await self.safe_send(int(creator['id']), notice + '\n\nاین گروه در MEGA BOT محدود شده است.')
+                except Exception:
+                    pass
             else:
-                sent=await self.safe_send(target_id,notice+'\n\nبرای پیگیری، بخش *تیم من* را باز کن.')
-            await self.safe_send(chat_id,f"✅ پرونده ثبت شد.\nکد: `#{case['case_code']}`\nمدت: {duration}\nاعلان: {'ارسال شد' if sent else 'ارسال پیام ممکن نشد'}",inline([[('↩️ برگشت','admin:page:0'),('✖️ بستن','close')]]))
+                try:
+                    await self.safe_send(target_id, notice, permanent=True)
+                except Exception:
+                    pass
+            await self.safe_send(
+                chat_id,
+                f"✅ بن ثبت شد.\nمدت: {duration}\nپکیج آن‌بن: {pkg}\nکد پرونده: `#{case['case_code']}`",
+                inline([[('↩️ برگشت', 'admin:page:0'), ('✖️ بستن', 'close')]]),
+            )
             return True
         return False
 

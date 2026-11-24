@@ -49,7 +49,8 @@ CREATE TABLE IF NOT EXISTS moderation_cases (
   id BIGSERIAL PRIMARY KEY, case_code INTEGER UNIQUE NOT NULL CHECK (case_code BETWEEN 1000 AND 9999),
   target_type TEXT NOT NULL CHECK (target_type IN ('user','group')), target_id BIGINT NOT NULL,
   target_username TEXT, target_name TEXT NOT NULL DEFAULT '', reason TEXT NOT NULL,
-  duration_days INTEGER, permanent BOOLEAN NOT NULL DEFAULT FALSE, active BOOLEAN NOT NULL DEFAULT TRUE,
+  duration_days INTEGER, permanent BOOLEAN NOT NULL DEFAULT FALSE,
+  unban_package BOOLEAN NOT NULL DEFAULT FALSE, active BOOLEAN NOT NULL DEFAULT TRUE,
   action TEXT NOT NULL DEFAULT 'ban', issued_by BIGINT NOT NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), expires_at TIMESTAMPTZ,
   lifted_by BIGINT, lifted_at TIMESTAMPTZ, lift_reason TEXT
@@ -401,6 +402,7 @@ class Database:
   matched_terms TEXT,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 )""")
+            await conn.execute('ALTER TABLE moderation_cases ADD COLUMN IF NOT EXISTS unban_package BOOLEAN NOT NULL DEFAULT FALSE')
             await conn.execute('CREATE INDEX IF NOT EXISTS mention_watch_user_idx ON mention_watch_logs (user_id, created_at DESC)')
 
             await conn.execute("ALTER TABLE groups_seen ADD COLUMN IF NOT EXISTS bot_status TEXT NOT NULL DEFAULT 'member'")
@@ -925,7 +927,7 @@ class Database:
                     cid,
                 )
 
-    async def create_case(self, target_type: str, target_id: int, username: str | None, name: str, reason: str, days: int | None, permanent: bool, actor: int) -> dict:
+    async def create_case(self, target_type: str, target_id: int, username: str | None, name: str, reason: str, days: int | None, permanent: bool, actor: int, *, unban_package: bool = False) -> dict:
         from datetime import timedelta
         async with self._pool().acquire() as c:
             async with c.transaction():
@@ -936,8 +938,8 @@ class Database:
                 if code is None:
                     raise RuntimeError('ظرفیت کدهای پیگیری چهارتایی تمام شده است.')
                 expires = None if permanent or not days else datetime.now(timezone.utc) + timedelta(days=days)
-                row = await c.fetchrow("""INSERT INTO moderation_cases(case_code,target_type,target_id,target_username,target_name,reason,duration_days,permanent,issued_by,expires_at)
-                  VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *""", code,target_type,target_id,username,name,reason,days,permanent,actor,expires)
+                row = await c.fetchrow("""INSERT INTO moderation_cases(case_code,target_type,target_id,target_username,target_name,reason,duration_days,permanent,issued_by,expires_at,unban_package)
+                  VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *""", code,target_type,target_id,username,name,reason,days,permanent,actor,expires,bool(unban_package))
                 await c.execute('INSERT INTO audit_logs(actor_id,action,target_type,target_id,details) VALUES($1,$2,$3,$4,$5)', actor, 'ban_'+target_type, target_type, target_id, {'case_code': code})
         return dict(row)
 

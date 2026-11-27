@@ -1092,13 +1092,13 @@ class MegaBot:
             return
         if text.startswith('/admin'):
             if uid != OWNER_ID and not await self.db.is_admin(uid):
-                await self._cb_alert(getattr(self, '_current_callback_id', None), '⛔ دسترسی به پنل مدیریت نداری.', chat_id)
+                await self._cb_alert(getattr(self, '_current_callback_id', None), '⛔ دسترسی به پنل مدیریت نداری.', chat_id, user_id=uid)
                 return
             await self.show_admin(chat_id, uid, owner=(uid == OWNER_ID))
             return
         if text in ('تنظیم مبلغ حمایت', 'تنظیم مبلغ حمایت مالی', '/set_donations_total'):
             if uid != OWNER_ID:
-                await self._cb_alert(getattr(self, '_current_callback_id', None), '⛔ این دستور فقط برای مالک اصلی ربات است.', chat_id)
+                await self._cb_alert(getattr(self, '_current_callback_id', None), '⛔ این دستور فقط برای مالک اصلی ربات است.', chat_id, user_id=uid)
                 return
             try:
                 current = await self.db.get_donations_total()
@@ -1120,7 +1120,7 @@ class MegaBot:
 
         if text in ('تست رنگ', 'تست دکمه', '/testcolor'):
             if uid != OWNER_ID:
-                await self._cb_alert(getattr(self, '_current_callback_id', None), '⛔ فقط مالک.', chat_id)
+                await self._cb_alert(getattr(self, '_current_callback_id', None), '⛔ فقط مالک.', chat_id, user_id=uid)
                 return
             # Exact sample from docs.bale.ai — must show green/red if client supports style
             kb = {
@@ -1145,14 +1145,14 @@ class MegaBot:
 
         if text.startswith('/owner'):
             if uid != OWNER_ID:
-                await self._cb_alert(getattr(self, '_current_callback_id', None), '⛔ این پنل فقط برای مالک ربات است.', chat_id)
+                await self._cb_alert(getattr(self, '_current_callback_id', None), '⛔ این پنل فقط برای مالک ربات است.', chat_id, user_id=uid)
                 return
             await self.show_admin(chat_id, uid, owner=True)
             return
         # Owner diagnostics for a specific group id (e.g. /checkgroup 4739068741)
         if text.startswith('/checkgroup') or text.startswith('/گروه'):
             if uid != OWNER_ID:
-                await self._cb_alert(getattr(self, '_current_callback_id', None), '⛔ فقط مالک.', chat_id)
+                await self._cb_alert(getattr(self, '_current_callback_id', None), '⛔ فقط مالک.', chat_id, user_id=uid)
                 return
             parts = text.split()
             if len(parts) < 2 or not parts[1].lstrip('-').isdigit():
@@ -1162,7 +1162,7 @@ class MegaBot:
             return
         if text.startswith('/unrestrictgroup') or text.startswith('/رفعگروه'):
             if uid != OWNER_ID:
-                await self._cb_alert(getattr(self, '_current_callback_id', None), '⛔ فقط مالک.', chat_id)
+                await self._cb_alert(getattr(self, '_current_callback_id', None), '⛔ فقط مالک.', chat_id, user_id=uid)
                 return
             parts = text.split()
             if len(parts) < 2 or not parts[1].lstrip('-').isdigit():
@@ -1242,7 +1242,7 @@ class MegaBot:
             return
         if text == 'پین' and msg.get('reply_to_message'):
             if not (await self._is_chat_admin(chat_id, uid) or uid == OWNER_ID):
-                await self._cb_alert(getattr(self, '_current_callback_id', None), '⛔ پین پیام فقط برای مدیران گروه فعاله.', chat_id)
+                await self._cb_alert(getattr(self, '_current_callback_id', None), '⛔ پین پیام فقط برای مدیران گروه فعاله.', chat_id, user_id=uid)
                 return
             try:
                 await self.api.pin_message(chat_id, int(msg['reply_to_message']['message_id']))
@@ -1287,13 +1287,13 @@ class MegaBot:
         # ── Group VIP list / management commands
         if is_group and text in ('لیست ویژه ها', 'لیست ویژه‌ها', 'لیست ویژه'):
             if not (await self._is_chat_admin(chat_id, uid) or uid == OWNER_ID):
-                await self._cb_alert(getattr(self, '_current_callback_id', None), '⛔ فقط ادمین گروه.', chat_id)
+                await self._cb_alert(getattr(self, '_current_callback_id', None), '⛔ فقط ادمین گروه.', chat_id, user_id=uid)
                 return
             await self._show_vip_list(chat_id, 0)
             return
         if is_group and text in ('ویژه',) and msg.get('reply_to_message'):
             if not (await self._is_chat_admin(chat_id, uid) or uid == OWNER_ID):
-                await self._cb_alert(getattr(self, '_current_callback_id', None), '⛔ افزودن کاربر ویژه فقط برای مدیران گروه است.', chat_id)
+                await self._cb_alert(getattr(self, '_current_callback_id', None), '⛔ افزودن کاربر ویژه فقط برای مدیران گروه است.', chat_id, user_id=uid)
                 return
             target = (msg.get('reply_to_message') or {}).get('from') or {}
             tid = int(target.get('id') or 0)
@@ -1307,7 +1307,7 @@ class MegaBot:
             return
         if is_group and text in ('حذف ویژه',) and msg.get('reply_to_message'):
             if not (await self._is_chat_admin(chat_id, uid) or uid == OWNER_ID):
-                await self._cb_alert(getattr(self, '_current_callback_id', None), '⛔ فقط ادمین گروه.', chat_id)
+                await self._cb_alert(getattr(self, '_current_callback_id', None), '⛔ فقط ادمین گروه.', chat_id, user_id=uid)
                 return
             target = (msg.get('reply_to_message') or {}).get('from') or {}
             tid = int(target.get('id') or 0)
@@ -1324,7 +1324,7 @@ class MegaBot:
             return
         if is_group and (text.startswith('ویژه ') or text.startswith('افزودن ویژه ')):
             if not (await self._is_chat_admin(chat_id, uid) or uid == OWNER_ID):
-                await self._cb_alert(getattr(self, '_current_callback_id', None), '⛔ فقط ادمین گروه.', chat_id)
+                await self._cb_alert(getattr(self, '_current_callback_id', None), '⛔ فقط ادمین گروه.', chat_id, user_id=uid)
                 return
             term = text.split(None, 1)[1].strip().lstrip('@')
             if term.isdigit() or (term.startswith('-') and term[1:].isdigit()):
@@ -1388,7 +1388,7 @@ class MegaBot:
 
         if is_group and text in ('قفل', 'قفل ها', 'قفل‌ها', 'ضد اسپم', 'ضداسپم', 'پنل قفل'):
             if not (await self._is_chat_admin(chat_id, uid) or uid == OWNER_ID):
-                await self._cb_alert(getattr(self, '_current_callback_id', None), '⛔ این بخش مخصوص مدیران گروه است.', chat_id)
+                await self._cb_alert(getattr(self, '_current_callback_id', None), '⛔ این بخش مخصوص مدیران گروه است.', chat_id, user_id=uid)
                 return
             await self._show_locks_panel(chat_id, message_id=None)
             return
@@ -1396,7 +1396,7 @@ class MegaBot:
         # ── Welcome panel
         if is_group and text in ('خوشامد', 'خوش آمد', 'خوشامد ها', 'خوشامدها', 'پنل خوشامد'):
             if not (await self._is_chat_admin(chat_id, uid) or uid == OWNER_ID):
-                await self._cb_alert(getattr(self, '_current_callback_id', None), '⛔ این بخش مخصوص مدیران گروه است.', chat_id)
+                await self._cb_alert(getattr(self, '_current_callback_id', None), '⛔ این بخش مخصوص مدیران گروه است.', chat_id, user_id=uid)
                 return
             await self._show_welcome_panel(chat_id, message_id=None)
             return
@@ -1404,7 +1404,7 @@ class MegaBot:
         # ── Goodbye / farewell panel (exact phrases; avoid social_reply conflict)
         if is_group and text in ('خداحافظی', 'تنظیم خداحافظی', 'بدرقه', 'پنل بدرقه', 'پنل خداحافظی', 'پنل خدافظ', 'خدافظی'):
             if not (await self._is_chat_admin(chat_id, uid) or uid == OWNER_ID):
-                await self._cb_alert(getattr(self, '_current_callback_id', None), '⛔ این بخش مخصوص مدیران گروه است.', chat_id)
+                await self._cb_alert(getattr(self, '_current_callback_id', None), '⛔ این بخش مخصوص مدیران گروه است.', chat_id, user_id=uid)
                 return
             await self._show_goodbye_panel(chat_id, message_id=None)
             return
@@ -1416,13 +1416,13 @@ class MegaBot:
         # ── Group settings panel
         if is_group and text in ('تنظیمات گروه', 'پنل گروه', 'امنیت گروه'):
             if not (await self._is_chat_admin(chat_id, uid) or uid == OWNER_ID):
-                await self._cb_alert(getattr(self, '_current_callback_id', None), '⛔ این بخش مخصوص مدیران گروه است.', chat_id)
+                await self._cb_alert(getattr(self, '_current_callback_id', None), '⛔ این بخش مخصوص مدیران گروه است.', chat_id, user_id=uid)
                 return
             await self._show_group_panel(chat_id, uid)
             return
         if is_group and text.startswith('خوشامدگویی '):
             if not (await self._is_chat_admin(chat_id, uid) or uid == OWNER_ID):
-                await self._cb_alert(getattr(self, '_current_callback_id', None), '⛔ این بخش مخصوص مدیران گروه است.', chat_id)
+                await self._cb_alert(getattr(self, '_current_callback_id', None), '⛔ این بخش مخصوص مدیران گروه است.', chat_id, user_id=uid)
                 return
             body = text[len('خوشامدگویی '):].strip()
             if body in ('خاموش', 'off', 'غیرفعال'):
@@ -1443,7 +1443,7 @@ class MegaBot:
             return
         if is_group and text.startswith('خداحافظی '):
             if not (await self._is_chat_admin(chat_id, uid) or uid == OWNER_ID):
-                await self._cb_alert(getattr(self, '_current_callback_id', None), '⛔ این بخش مخصوص مدیران گروه است.', chat_id)
+                await self._cb_alert(getattr(self, '_current_callback_id', None), '⛔ این بخش مخصوص مدیران گروه است.', chat_id, user_id=uid)
                 return
             body = text[len('خداحافظی '):].strip()
             if body in ('خاموش', 'off', 'غیرفعال'):
@@ -1534,14 +1534,14 @@ class MegaBot:
         # ── Learned list / delete (in groups: admin/owner only)
         if text in ('لیست یادگیری', '🧠 لیست یادگیری'):
             if is_group and not (await self._is_chat_admin(chat_id, uid) or uid == OWNER_ID):
-                await self._cb_alert(getattr(self, '_current_callback_id', None), '⛔ این قابلیت فقط برای مدیران گروه فعاله!', chat_id)
+                await self._cb_alert(getattr(self, '_current_callback_id', None), '⛔ این قابلیت فقط برای مدیران گروه فعاله!', chat_id, user_id=uid)
                 return
             scope_type, scope_id = ('group', chat_id) if is_group else ('private', uid)
             await self._show_learned_list(chat_id, scope_type, scope_id, 0, requester_uid=uid)
             return
         if text.startswith('حذف کلمه '):
             if is_group and not (await self._is_chat_admin(chat_id, uid) or uid == OWNER_ID):
-                await self._cb_alert(getattr(self, '_current_callback_id', None), '⛔ این قابلیت فقط برای مدیران گروه فعاله!', chat_id)
+                await self._cb_alert(getattr(self, '_current_callback_id', None), '⛔ این قابلیت فقط برای مدیران گروه فعاله!', chat_id, user_id=uid)
                 return
             phrase = text[len('حذف کلمه '):].strip()
             if not phrase:
@@ -1563,7 +1563,7 @@ class MegaBot:
         # ── Group learn: «گروهی یاد بگیر» + pairs on separate lines (group: admin only)
         if text.strip().startswith('گروهی یاد بگیر'):
             if is_group and not (await self._is_chat_admin(chat_id, uid) or uid == OWNER_ID):
-                await self._cb_alert(getattr(self, '_current_callback_id', None), '⛔ این قابلیت فقط برای مدیران گروه فعاله!', chat_id)
+                await self._cb_alert(getattr(self, '_current_callback_id', None), '⛔ این قابلیت فقط برای مدیران گروه فعاله!', chat_id, user_id=uid)
                 return
             await self._handle_group_learn(chat_id, uid, is_group, text, msg)
             return
@@ -1572,7 +1572,7 @@ class MegaBot:
         learned_pair = self._parse_learn_command(text)
         if learned_pair:
             if is_group and not (await self._is_chat_admin(chat_id, uid) or uid == OWNER_ID):
-                await self._cb_alert(getattr(self, '_current_callback_id', None), '⛔ این قابلیت فقط برای مدیران گروه فعاله!', chat_id)
+                await self._cb_alert(getattr(self, '_current_callback_id', None), '⛔ این قابلیت فقط برای مدیران گروه فعاله!', chat_id, user_id=uid)
                 return
             trigger_raw, response = learned_pair
             trigger_norm = self._normalize_trigger(trigger_raw)
@@ -1646,8 +1646,20 @@ class MegaBot:
             await self.safe_send(chat_id, reply, force_text=True, reply_to=msg.get('message_id'))
 
 
-    async def _cb_alert(self, callback_id: str | None, text: str, chat_id: int | None = None) -> None:
-        """Modal alert for callback; if no callback, short auto-deleting notice."""
+    async def _cb_alert(
+        self,
+        callback_id: str | None,
+        text: str,
+        chat_id: int | None = None,
+        *,
+        user_id: int | None = None,
+    ) -> None:
+        """Access / warning notice.
+
+        Real modal OK-alert (show_alert) ONLY works for inline-button callbacks
+        (Bale/Telegram answerCallbackQuery). For plain text commands there is no
+        API popup — we DM the user, or as last resort a 5s ephemeral group line.
+        """
         msg = (text or '⛔').strip()
         if len(msg) > 180:
             msg = msg[:177] + '…'
@@ -1659,16 +1671,40 @@ class MegaBot:
                 return
             except Exception:
                 log.warning('cb_alert failed', exc_info=True)
-        # Fallback (rare): ephemeral chat notice so groups are not polluted long-term
+
+        # Text-command path: never leave a sticky warning in the group.
+        uid = user_id or getattr(self, '_current_uid', None)
+        if uid:
+            try:
+                # Private notice — only the actor sees it
+                sent = await self.safe_send(
+                    int(uid),
+                    msg,
+                    parse_mode=None,
+                    permanent=True,
+                    skip_ad=True,
+                )
+                if sent:
+                    return
+            except Exception:
+                log.debug('deny dm failed', exc_info=True)
+
         if chat_id:
             try:
-                await self.safe_send(chat_id, msg, parse_mode=None, ttl=8.0)
+                # Last resort: very short-lived group line (auto-delete)
+                await self.safe_send(chat_id, msg, parse_mode=None, ttl=5.0, skip_ad=True)
             except Exception:
                 pass
 
-    async def _deny(self, text: str, *, chat_id: int | None = None, callback_id: str | None = None) -> None:
-        """Unified access/warning notice: prefer show_alert, else short TTL message."""
-        await self._cb_alert(callback_id, text, chat_id=chat_id)
+    async def _deny(
+        self,
+        text: str,
+        *,
+        chat_id: int | None = None,
+        callback_id: str | None = None,
+        user_id: int | None = None,
+    ) -> None:
+        await self._cb_alert(callback_id, text, chat_id=chat_id, user_id=user_id)
 
     async def _cb_ack(self, callback_id: str | None, text: str = '') -> None:
         """Silent/ack toast for callback; no-op if already answered."""
@@ -1693,6 +1729,7 @@ class MegaBot:
         data = (query.get('data') or '').strip()
         user = query.get('from') or {}
         uid = int(user.get('id', 0) or 0)
+        self._current_uid = uid
         message = query.get('message') or {}
         chat = message.get('chat') or {}
         chat_id = int(chat.get('id', 0) or 0)
@@ -3247,7 +3284,7 @@ class MegaBot:
         is_owner = actor_st == 'creator' or uid == OWNER_ID
         is_admin = actor_st in ('creator', 'administrator') or uid == OWNER_ID
         if not is_admin:
-            await self._cb_alert(getattr(self, '_current_callback_id', None), '⛔ فقط مالک یا ادمین گروه می‌تواند لقب تنظیم کند.', chat_id)
+            await self._cb_alert(getattr(self, '_current_callback_id', None), '⛔ فقط مالک یا ادمین گروه می‌تواند لقب تنظیم کند.', chat_id, user_id=uid)
             return
 
         target_st = await self._get_member_status(chat_id, tid)
@@ -3704,7 +3741,7 @@ class MegaBot:
 
     async def handle_donation_review(self, uid: int, chat_id: int, message_id: int, data: str) -> None:
         if int(uid) != int(OWNER_ID):
-            await self._cb_alert(getattr(self, '_current_callback_id', None), '⛔ فقط مالک ربات می‌تواند درخواست حمایت مالی را تأیید کند.', chat_id)
+            await self._cb_alert(getattr(self, '_current_callback_id', None), '⛔ فقط مالک ربات می‌تواند درخواست حمایت مالی را تأیید کند.', chat_id, user_id=uid)
             return
         try:
             # data = donation_review:approve:123  or  donation_review:reject:123
@@ -4571,7 +4608,7 @@ class MegaBot:
         action = parts[2]
         # Must match the chat where the button was pressed
         if int(chat_id) != group_id:
-            await self._cb_alert(getattr(self, '_current_callback_id', None), '⛔ این عملیات فقط در همان گروه معتبر است.', chat_id)
+            await self._cb_alert(getattr(self, '_current_callback_id', None), '⛔ این عملیات فقط در همان گروه معتبر است.', chat_id, user_id=uid)
             return
         if not await self._require_group_admin(group_id, uid):
             await self.safe_edit(
@@ -4889,14 +4926,14 @@ class MegaBot:
             await self.safe_edit(chat_id,message_id,'ادمین حذف شد.',inline([[('↩️ برگشت','own:admins'),('✖️ بستن','close')]])); return
         if data == 'own:mon' or data.startswith('own:mon:'):
             if uid != OWNER_ID:
-                await self._cb_alert(getattr(self, '_current_callback_id', None), '⛔ فقط مالک.', chat_id)
+                await self._cb_alert(getattr(self, '_current_callback_id', None), '⛔ فقط مالک.', chat_id, user_id=uid)
                 return
             await self._show_owner_monitoring(chat_id, message_id, data)
             return
 
         if data.startswith('own:groups'):
             if not owner:
-                await self._cb_alert(getattr(self, '_current_callback_id', None), '⛔ فقط مالک ربات به لیست گروه‌ها دسترسی دارد.', chat_id)
+                await self._cb_alert(getattr(self, '_current_callback_id', None), '⛔ فقط مالک ربات به لیست گروه‌ها دسترسی دارد.', chat_id, user_id=uid)
                 return
             try:
                 page = int(data.rsplit(':', 1)[-1])
@@ -4906,7 +4943,7 @@ class MegaBot:
             return
         if data.startswith('own:users'):
             if not owner:
-                await self._cb_alert(getattr(self, '_current_callback_id', None), '⛔ فقط مالک ربات به لیست کاربران دسترسی دارد.', chat_id)
+                await self._cb_alert(getattr(self, '_current_callback_id', None), '⛔ فقط مالک ربات به لیست کاربران دسترسی دارد.', chat_id, user_id=uid)
                 return
             try:
                 page = int(data.rsplit(':', 1)[-1])
@@ -4990,10 +5027,10 @@ class MegaBot:
     async def handle_user_search_extra(self, uid: int, chat_id: int, message_id: int, data: str) -> None:
         """Groups in common, mention history, and owner/admin warn wizard for a searched user."""
         if uid != OWNER_ID and not await self.db.is_admin(uid):
-            await self._cb_alert(getattr(self, '_current_callback_id', None), '⛔ دسترسی مدیریت نداری.', chat_id)
+            await self._cb_alert(getattr(self, '_current_callback_id', None), '⛔ دسترسی مدیریت نداری.', chat_id, user_id=uid)
             return
         if not await self.has_perm(uid, 'search') and uid != OWNER_ID:
-            await self._cb_alert(getattr(self, '_current_callback_id', None), '⛔ مجوز جست‌وجو نداری.', chat_id)
+            await self._cb_alert(getattr(self, '_current_callback_id', None), '⛔ مجوز جست‌وجو نداری.', chat_id, user_id=uid)
             return
         parts = data.split(':')
         kind = parts[1] if len(parts) > 1 else ''
@@ -5285,7 +5322,7 @@ class MegaBot:
         target_id=int(target_id)
         perm = ('ban_' if action=='ban' else 'unban_')+target_type
         if not await self.has_perm(uid,perm):
-            await self._cb_alert(getattr(self, '_current_callback_id', None), '⛔ این دسترسی برای حساب تو فعال نیست.', chat_id)
+            await self._cb_alert(getattr(self, '_current_callback_id', None), '⛔ این دسترسی برای حساب تو فعال نیست.', chat_id, user_id=uid)
             return
         if action == 'unban':
             case=await self.db.lift_case(target_type,target_id,uid)
@@ -5323,7 +5360,7 @@ class MegaBot:
 
     async def _handle_ad_callback(self, uid: int, chat_id: int, message_id: int, data: str) -> None:
         if uid != OWNER_ID and not await self.has_perm(uid, 'settings'):
-            await self._cb_alert(getattr(self, '_current_callback_id', None), '⛔ فقط مالک یا ادمین با مجوز تنظیمات می‌تواند تبلیغ را مدیریت کند.', chat_id)
+            await self._cb_alert(getattr(self, '_current_callback_id', None), '⛔ فقط مالک یا ادمین با مجوز تنظیمات می‌تواند تبلیغ را مدیریت کند.', chat_id, user_id=uid)
             return
         enabled, url, title = await self._get_ad_config()
         if data == 'adm:ad':
@@ -5494,10 +5531,10 @@ class MegaBot:
         if uid != OWNER_ID:
             try:
                 if not await self.has_perm(uid, 'settings'):
-                    await self._cb_alert(getattr(self, '_current_callback_id', None), '⛔ فقط مالک یا ادمین با مجوز تنظیمات.', chat_id)
+                    await self._cb_alert(getattr(self, '_current_callback_id', None), '⛔ فقط مالک یا ادمین با مجوز تنظیمات.', chat_id, user_id=uid)
                     return True
             except Exception:
-                await self._cb_alert(getattr(self, '_current_callback_id', None), '⛔ دسترسی کافی نیست.', chat_id)
+                await self._cb_alert(getattr(self, '_current_callback_id', None), '⛔ دسترسی کافی نیست.', chat_id, user_id=uid)
                 return True
         rest = raw[len('همگانی'):].strip()
         if not rest:
@@ -5569,7 +5606,7 @@ class MegaBot:
 
     async def _handle_broadcast_callback(self, uid: int, chat_id: int, message_id: int, data: str) -> None:
         if uid != OWNER_ID and not await self.has_perm(uid, 'settings'):
-            await self._cb_alert(getattr(self, '_current_callback_id', None), '⛔ فقط مالک یا ادمین با مجوز تنظیمات می‌تواند پیام همگانی بفرستد.', chat_id)
+            await self._cb_alert(getattr(self, '_current_callback_id', None), '⛔ فقط مالک یا ادمین با مجوز تنظیمات می‌تواند پیام همگانی بفرستد.', chat_id, user_id=uid)
             return
         if data == 'adm:broadcast':
             if self._broadcast_running:
@@ -6475,13 +6512,13 @@ class MegaBot:
             await self.safe_edit(chat_id, message_id, '⌛ این درخواست منقضی شده.', None)
             return
         if int(pending.get('chat_id') or 0) != chat_id:
-            await self._cb_alert(getattr(self, '_current_callback_id', None), '⛔ این عملیات مربوط به این گروه نیست.', chat_id)
+            await self._cb_alert(getattr(self, '_current_callback_id', None), '⛔ این عملیات مربوط به این گروه نیست.', chat_id, user_id=uid)
             return
         if int(pending.get('uid') or 0) != uid and uid != OWNER_ID:
-            await self._cb_alert(getattr(self, '_current_callback_id', None), '⛔ فقط کسی که درخواست داده می‌تواند تأیید کند.', chat_id)
+            await self._cb_alert(getattr(self, '_current_callback_id', None), '⛔ فقط کسی که درخواست داده می‌تواند تأیید کند.', chat_id, user_id=uid)
             return
         if not await self._require_group_admin(chat_id, uid):
-            await self._cb_alert(getattr(self, '_current_callback_id', None), '⛔ این دستور فقط برای مدیران گروه یا کاربران ویژه است.', chat_id)
+            await self._cb_alert(getattr(self, '_current_callback_id', None), '⛔ این دستور فقط برای مدیران گروه یا کاربران ویژه است.', chat_id, user_id=uid)
             return
         if decision == 'no':
             self._purge_pending.pop(token, None)
@@ -8714,7 +8751,7 @@ class MegaBot:
         if norm in ('توقف ریپیت', 'توقف تکرار', 'توقف اتو', 'توقف اتوماسیون',
                     'حذف همه ریپیت', 'حذف همه اتو'):
             if not is_mod:
-                await self._cb_alert(getattr(self, '_current_callback_id', None), '⛔ فقط ادمین گروه یا مالک ربات.', chat_id)
+                await self._cb_alert(getattr(self, '_current_callback_id', None), '⛔ فقط ادمین گروه یا مالک ربات.', chat_id, user_id=uid)
                 return True
             n = await self.db.clear_auto_messages(chat_id)
             await self.safe_send(
@@ -8726,7 +8763,7 @@ class MegaBot:
         mdel = re.match(r'^(?:حذف ریپیت|حذف اتو|حذف تکرار)\s+#?([\d۰-۹]+)\s*$', norm)
         if mdel:
             if not is_mod:
-                await self._cb_alert(getattr(self, '_current_callback_id', None), '⛔ فقط ادمین گروه یا مالک ربات.', chat_id)
+                await self._cb_alert(getattr(self, '_current_callback_id', None), '⛔ فقط ادمین گروه یا مالک ربات.', chat_id, user_id=uid)
                 return True
             aid = self._fa_digits_to_int(mdel.group(1))
             ok = await self.db.delete_auto_message(chat_id, aid)
@@ -8750,7 +8787,7 @@ class MegaBot:
         if not m:
             if re.match(r'^(ریپیت|تکرار|اتو|اتوماسیون)\b', norm):
                 if not is_mod:
-                    await self._cb_alert(getattr(self, '_current_callback_id', None), '⛔ فقط ادمین گروه یا مالک ربات.', chat_id)
+                    await self._cb_alert(getattr(self, '_current_callback_id', None), '⛔ فقط ادمین گروه یا مالک ربات.', chat_id, user_id=uid)
                     return True
                 await self.safe_send(
                     chat_id,
@@ -8829,10 +8866,10 @@ class MegaBot:
             return
         # Must operate in the same group (or owner DM reviewing — still require mod power on target)
         if int(chat_id) != int(target_chat) and uid != OWNER_ID:
-            await self._cb_alert(getattr(self, '_current_callback_id', None), '⛔ این دکمه فقط در همان گروه معتبر است.', chat_id)
+            await self._cb_alert(getattr(self, '_current_callback_id', None), '⛔ این دکمه فقط در همان گروه معتبر است.', chat_id, user_id=uid)
             return
         if not (uid == OWNER_ID or await self._has_group_mod_power(target_chat, uid)):
-            await self._cb_alert(getattr(self, '_current_callback_id', None), '⛔ فقط ادمین گروه یا مالک ربات.', chat_id)
+            await self._cb_alert(getattr(self, '_current_callback_id', None), '⛔ فقط ادمین گروه یا مالک ربات.', chat_id, user_id=uid)
             return
         if action == 'clear':
             n = await self.db.clear_auto_messages(target_chat)

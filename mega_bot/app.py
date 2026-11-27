@@ -47,9 +47,8 @@ PERMISSION_LABELS = {
 
 class MegaBot:
     def __init__(self, api: BaleAPI, db: Database):
-        self.api, self.db =
+        self.api, self.db = api, db
         self._pv_warn_mids: dict[tuple[int, str], int] = {}
- api, db
         self.msg = MessageHub(self)
         # chat_id -> type string from last seen API update (private|group|...)
         self._chat_kinds: dict[int, str] = {}

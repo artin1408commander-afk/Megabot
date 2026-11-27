@@ -47,7 +47,9 @@ PERMISSION_LABELS = {
 
 class MegaBot:
     def __init__(self, api: BaleAPI, db: Database):
-        self.api, self.db = api, db
+        self.api, self.db =
+        self._pv_warn_mids: dict[tuple[int, str], int] = {}
+ api, db
         self.msg = MessageHub(self)
         # chat_id -> type string from last seen API update (private|group|...)
         self._chat_kinds: dict[int, str] = {}
@@ -1414,6 +1416,29 @@ class MegaBot:
             await self._show_goodbye_panel(chat_id, message_id=None)
             return
 
+        # ── Force join panel (group)
+        _fj_cmds = {
+            'جوین اجباری', 'اجباری', 'جوین', 'force join', 'forcejoin', 'force_join',
+            'پنل جوین اجباری', 'جوین‌اجباری',
+        }
+        if is_group and (text in _fj_cmds or text.lower() in _fj_cmds):
+            if not (await self._is_chat_admin(chat_id, uid) or uid == OWNER_ID):
+                await self._cb_alert(
+                    getattr(self, '_current_callback_id', None),
+                    '⛔ پنل جوین اجباری فقط برای مدیران گروه است.',
+                    chat_id,
+                    user_id=uid,
+                )
+                return
+            await self._show_group_force_join_panel(chat_id, message_id=None)
+            return
+        # Owner global force-join panel (private chat)
+        if (not is_group) and uid == OWNER_ID and (
+            text in _fj_cmds or text.lower() in {'force join', 'forcejoin', 'force_join'}
+        ):
+            await self._show_owner_force_joins(chat_id, message_id=None)
+            return
+
         # ── Group settings panel
         if is_group and text in ('تنظیمات گروه', 'پنل گروه', 'امنیت گروه'):
             if not (await self._is_chat_admin(chat_id, uid) or uid == OWNER_ID):
@@ -1673,26 +1698,41 @@ class MegaBot:
             except Exception:
                 log.warning('cb_alert failed', exc_info=True)
 
-        # Text-command path: never leave a sticky warning in the group.
+        # Text-command path: one PV warning per text, auto-delete after 15s.
+        # If the same warning is triggered again, send a fresh PV message (previous already deleted/replaced).
         uid = user_id or getattr(self, '_current_uid', None)
         if uid:
             try:
-                # Private notice — only the actor sees it
+                if not hasattr(self, '_pv_warn_mids') or self._pv_warn_mids is None:
+                    self._pv_warn_mids = {}
+                key = (int(uid), msg)
+                prev = self._pv_warn_mids.get(key)
+                if prev:
+                    try:
+                        await self.api.delete_message(int(uid), int(prev))
+                    except Exception:
+                        pass
+                    self._pv_warn_mids.pop(key, None)
                 sent = await self.safe_send(
                     int(uid),
                     msg,
                     parse_mode=None,
-                    permanent=True,
+                    permanent=False,
                     skip_ad=True,
+                    ttl=15.0,
                 )
                 if sent:
+                    mid = None
+                    if isinstance(sent, dict):
+                        mid = sent.get('message_id') or (sent.get('result') or {}).get('message_id')
+                    if mid:
+                        self._pv_warn_mids[key] = int(mid)
                     return
             except Exception:
                 log.debug('deny dm failed', exc_info=True)
 
         if chat_id:
             try:
-                # Last resort: very short-lived group line (auto-delete)
                 await self.safe_send(chat_id, msg, parse_mode=None, ttl=5.0, skip_ad=True)
             except Exception:
                 pass

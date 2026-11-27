@@ -696,6 +696,7 @@ class MegaBot:
                 'is_bot': False,
             }
         uid = int(user.get('id', 0) or 0)
+        self._current_uid = uid
         # Never process the bot's own messages (prevents loops after group replies).
         if user.get('is_bot') or not uid:
             return

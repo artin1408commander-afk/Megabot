@@ -45,6 +45,12 @@ _COMBINING_RE = re.compile(r'[\u0300-\u036f\u0483-\u0489\u0610-\u061a\u064b-\u06
 # Latin letters (strict anti-link policy)
 _LATIN_RE = re.compile(r'[A-Za-z]')
 
+
+def has_latin_letters(text: str) -> bool:
+    """True if message contains any English/Latin letter A-Z."""
+    return bool(text and _LATIN_RE.search(text))
+
+
 # Markdown / uid patterns
 _MD_LINK_RE = re.compile(r'\[[^\]]{0,80}\]\(\s*(https?://[^)\s]+|tg://[^)\s]+|uid:\d+|www\.[^)\s]+)\)', re.I)
 _UID_RE = re.compile(r'(?:^|[^\w])uid\s*:\s*\d{3,}', re.I)
@@ -212,10 +218,10 @@ def detect_links(
     text: str,
     entities: list | None = None,
     *,
-    block_latin: bool = True,
+    block_latin: bool = False,
     block_at_username: bool = True,
 ) -> DetectionResult:
-    """Advanced anti-link. block_latin=True enforces A-Z ban when lock is on."""
+    """Advanced anti-link for URLs/@id/uid. Latin letters only if block_latin=True."""
     reasons: list[str] = []
     body = text or ''
 

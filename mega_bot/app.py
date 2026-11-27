@@ -6831,6 +6831,7 @@ class MegaBot:
     LOCK_LABELS: list[tuple[str, str]] = [
         ('antispam', '🚫 ضداسپم'),
         ('antilink', '🔗 قفل لینک'),
+        ('antienglish', '🔤 قفل حرف انگلیسی'),
         ('antirepeat', '🔁 قفل پیام تکراری'),
         ('antimention', '📢 قفل منشن انبوه'),
         ('antiforward', '📄 قفل فوروارد'),
@@ -7192,9 +7193,9 @@ class MegaBot:
         entities = msg.get('entities') or msg.get('caption_entities') or []
 
         if not reason and sec.get('antilink'):
-            # Advanced anti-link: entities, markdown, uid, domains, @id, latin letters
+            # Anti-link: URLs, @id, uid, domains — NOT plain English letters
             try:
-                link_hit = detect_links(body, entities, block_latin=True, block_at_username=True)
+                link_hit = detect_links(body, entities, block_latin=False, block_at_username=True)
                 if link_hit.hit:
                     reason = 'لینک'
                     log.info(
@@ -7205,6 +7206,16 @@ class MegaBot:
                 log.exception('detect_links failed')
                 if self._message_has_link(body, entities):
                     reason = 'لینک'
+        if not reason and sec.get('antienglish'):
+            try:
+                from mega_bot.anti_abuse import has_latin_letters
+                if has_latin_letters(body):
+                    reason = 'حروف انگلیسی'
+                    log.info('antienglish hit chat=%s uid=%s', chat_id, uid)
+            except Exception:
+                log.exception('antienglish check failed')
+                if body and any(('A' <= c <= 'Z') or ('a' <= c <= 'z') for c in body):
+                    reason = 'حروف انگلیسی'
         if not reason and sec.get('antimention'):
             mention_limit = int(mod.get('mention_limit') or 5)
             if self._count_mentions(body, entities) >= mention_limit:

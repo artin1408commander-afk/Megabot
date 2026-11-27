@@ -1029,7 +1029,7 @@ class Database:
     # ── Group settings / welcome / security ─────────────────────────────
 
     DEFAULT_SECURITY = {
-        'antispam': False, 'antilink': False, 'antiad': False, 'antirepeat': False,
+        'antispam': False, 'antilink': False, 'antienglish': False, 'antiad': False, 'antirepeat': False,
         'antiflood': False, 'antiprofane': False, 'antiphoto': False, 'antivideo': False,
         'antivoice': False, 'antiaudio': False, 'antigif': False, 'antisticker': False,
         'antidoc': False, 'anticontact': False,

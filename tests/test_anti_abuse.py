@@ -90,3 +90,14 @@ def test_invisible_chars():
 def test_detect_result_fields():
     r = detect_advertisement('فروش سکه بله ۵۰۰۰۰ تومان بیا پیوی')
     assert r.hit and r.score >= 7 and r.kind == 'ad'
+
+
+def test_english_not_link_when_block_latin_false():
+    from mega_bot.anti_abuse import detect_links, has_latin_letters
+    r = detect_links('hello how are you', block_latin=False, block_at_username=True)
+    assert not r.hit
+    assert has_latin_letters('hello')
+    r2 = detect_links('see https://evil.com now', block_latin=False)
+    assert r2.hit
+    r3 = detect_links('پیام به @somechannel', block_latin=False, block_at_username=True)
+    assert r3.hit

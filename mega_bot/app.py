@@ -1152,7 +1152,7 @@ class MegaBot:
         # Owner diagnostics for a specific group id (e.g. /checkgroup 4739068741)
         if text.startswith('/checkgroup') or text.startswith('/گروه'):
             if uid != OWNER_ID:
-                await self.safe_send(chat_id, '⛔ فقط مالک.')
+                await self.safe_send(chat_id, '⛔ فقط مالک.', parse_mode=None)
                 return
             parts = text.split()
             if len(parts) < 2 or not parts[1].lstrip('-').isdigit():
@@ -1162,7 +1162,7 @@ class MegaBot:
             return
         if text.startswith('/unrestrictgroup') or text.startswith('/رفعگروه'):
             if uid != OWNER_ID:
-                await self.safe_send(chat_id, '⛔ فقط مالک.')
+                await self.safe_send(chat_id, '⛔ فقط مالک.', parse_mode=None)
                 return
             parts = text.split()
             if len(parts) < 2 or not parts[1].lstrip('-').isdigit():
@@ -1645,6 +1645,30 @@ class MegaBot:
         if reply:
             await self.safe_send(chat_id, reply, force_text=True, reply_to=msg.get('message_id'))
 
+
+    async def _cb_alert(self, callback_id: str | None, text: str) -> None:
+        """Show a modal alert for a callback click (OK to dismiss). Never posts to group."""
+        if not callback_id:
+            return
+        msg = (text or '⛔').strip()
+        if len(msg) > 180:
+            msg = msg[:177] + '…'
+        try:
+            await self.api.answer_callback(callback_id, msg, show_alert=True)
+            self._cb_answered = True
+        except Exception:
+            log.warning('cb_alert failed', exc_info=True)
+
+    async def _cb_ack(self, callback_id: str | None, text: str = '') -> None:
+        """Silent/ack toast for callback; no-op if already answered."""
+        if not callback_id or getattr(self, '_cb_answered', False):
+            return
+        try:
+            await self.api.answer_callback(callback_id, text or '')
+            self._cb_answered = True
+        except Exception:
+            log.warning('cb_ack failed', exc_info=True)
+
     async def on_callback(self, query: dict) -> None:
         """Route every inline-button click to a visible outcome.
 
@@ -1695,30 +1719,30 @@ class MegaBot:
                         pass
                 return
 
-        # Always ack the click first so the client is not left loading.
-        if callback_id:
-            try:
-                await asyncio.wait_for(self.api.answer_callback(callback_id), timeout=5.0)
-            except Exception as exc:
-                log.warning('answerCallbackQuery failed: %s', type(exc).__name__)
+        # Do NOT answer early — permission denials need show_alert on the same answer.
+        self._cb_answered = False
+        self._current_callback_id = callback_id
 
         if not data:
-            await self.safe_edit(chat_id, message_id, 'دکمه نامعتبر بود.', None)
+            await self._cb_alert(callback_id, 'دکمه نامعتبر بود.')
             return
 
         try:
-            await self._route_callback(uid, chat_id, message_id, data, user, chat, query)
+            await self._route_callback(uid, chat_id, message_id, data, user, chat, query, callback_id)
         except Exception:
             log.exception('Callback handler crashed data=%r uid=%s', data, uid)
-            try:
-                await self.safe_send(chat_id, '⚠️ خطایی در پردازش دکمه رخ داد. دوباره تلاش کن.')
-            except Exception:
-                pass
+            if not getattr(self, '_cb_answered', False):
+                await self._cb_alert(callback_id, '⚠️ خطایی در پردازش دکمه رخ داد. دوباره تلاش کن.')
+        finally:
+            # Always finish the spinner if nothing answered yet
+            if not getattr(self, '_cb_answered', False):
+                await self._cb_ack(callback_id)
 
     async def _route_callback(
         self, uid: int, chat_id: int, message_id: int, data: str,
-        user: dict, chat: dict, query: dict,
+        user: dict, chat: dict, query: dict, callback_id: str | None = None,
     ) -> None:
+        callback_id = callback_id or getattr(self, '_current_callback_id', None)
         if data == 'onboard:ack':
             try:
                 await self.api.delete_message(chat_id, int(message_id))
@@ -1737,7 +1761,7 @@ class MegaBot:
             return
         if data == 'fj:panel':
             if not (await self._is_chat_admin(chat_id, uid) or uid == OWNER_ID):
-                await self.safe_send(chat_id, '⛔ فقط مدیران گروه.', parse_mode=None)
+                await self._cb_alert(callback_id, '⛔ فقط مدیران گروه.')
                 return
             await self._show_group_force_join_panel(chat_id, message_id)
             return
@@ -1798,7 +1822,7 @@ class MegaBot:
                 await self.safe_edit(chat_id, message_id, 'داده دکمه نامعتبر است.', None)
                 return
             if int(uid) != int(target_uid) and int(uid) != int(OWNER_ID):
-                await self.safe_send(chat_id, '⛔ این دکمه برای تو نیست.', parse_mode=None)
+                await self._cb_alert(callback_id, '⛔ این دکمه برای تو نیست.')
                 return
             try:
                 items = await self.db.list_force_joins(scope, int(host))
@@ -1963,7 +1987,7 @@ class MegaBot:
                 gid, choice = parts[2], parts[3]
                 game = self.game_cache.get(gid)
                 if not game:
-                    await self.safe_send(chat_id, 'این بازی دیگر فعال نیست.')
+                    await self._cb_alert(callback_id, 'این بازی دیگر فعال نیست.')
                     return
                 game.setdefault('players', {})[uid] = choice
                 if len(game['players']) >= 2:
@@ -1984,7 +2008,7 @@ class MegaBot:
             gid = data.rsplit(':', 1)[-1]
             game = self.game_cache.get(gid)
             if game and int(game.get('creator', -1)) != uid and uid != OWNER_ID:
-                await self.safe_send(chat_id, 'فقط سازنده می‌تواند بازی را لغو کند.')
+                await self._cb_alert(callback_id, 'فقط سازنده می‌تواند بازی را لغو کند.')
             else:
                 self.game_cache.pop(gid, None)
                 await self.safe_edit(chat_id, message_id, 'بازی لغو شد.', None)
@@ -2010,7 +2034,7 @@ class MegaBot:
             return
         if data.startswith('own:don_total:'):
             if uid != OWNER_ID:
-                await self.safe_send(chat_id, '⛔ فقط مالک اصلی ربات.', parse_mode=None)
+                await self._cb_alert(callback_id, '⛔ فقط مالک اصلی ربات.')
                 return
             if data == 'own:don_total:start':
                 try:
@@ -2059,7 +2083,7 @@ class MegaBot:
 
         if data.startswith('own:donation:') or data == 'own:donations':
             if uid != OWNER_ID:
-                await self.safe_send(chat_id, '⛔ فقط مالک.')
+                await self._cb_alert(callback_id, '⛔ فقط مالک.')
                 return
             if data == 'own:donations':
                 card = await self.db.get_setting('donation_card', '')
@@ -2110,7 +2134,7 @@ class MegaBot:
             if uid == OWNER_ID:
                 await self.show_admin(chat_id, uid, True, message_id)
             else:
-                await self.safe_send(chat_id, '⛔ فقط مالک ربات.')
+                await self._cb_alert(callback_id, '⛔ فقط مالک ربات.')
             return
 
         if data.startswith('admin:page:'):
@@ -2121,7 +2145,7 @@ class MegaBot:
                     page = 0
                 await self.show_admin(chat_id, uid, uid == OWNER_ID, message_id, page)
             else:
-                await self.safe_send(chat_id, '⛔ دسترسی پنل ادمین نداری.')
+                await self._cb_alert(callback_id, '⛔ دسترسی پنل ادمین نداری.')
             return
 
         if (
@@ -2162,13 +2186,9 @@ class MegaBot:
             await self._handle_group_callbacks(uid, chat_id, message_id, data, chat)
             return
 
-        # Unknown callback — always visible feedback
+        # Unknown callback — modal alert (no group spam)
         log.warning('Unhandled callback data=%r uid=%s', data, uid)
-        await self.safe_edit(
-            chat_id, message_id,
-            f'این دکمه دیگر معتبر نیست.\n`{data[:40]}`',
-            inline([[('↩️ منوی اصلی', 'home'), ('✖️ بستن', 'close')]]),
-        )
+        await self._cb_alert(callback_id, '⛔ این دکمه دیگر معتبر نیست.')
 
 
 
@@ -4746,7 +4766,7 @@ class MegaBot:
     async def handle_admin_callback(self, uid: int, chat_id: int, message_id: int, data: str) -> None:
         owner = uid == OWNER_ID
         if not owner and not await self.db.is_admin(uid):
-            await self.safe_send(chat_id,'⛔ دسترسی مدیریت نداری.')
+            await self._cb_alert(getattr(self, '_current_callback_id', None), '⛔ دسترسی مدیریت نداری.')
             return
         # --- Ad button management ---
         if data == 'adm:ad' or data.startswith('adm:ad:'):
@@ -4757,7 +4777,7 @@ class MegaBot:
             await self._handle_broadcast_callback(uid, chat_id, message_id, data)
             return
         if data == 'adm:stats':
-            if not await self.has_perm(uid,'stats'): return await self.safe_send(chat_id,'⛔ مجوز مشاهده آمار نداری.')
+            if not await self.has_perm(uid,'stats'): return await self._cb_alert(getattr(self, '_current_callback_id', None), '⛔ مجوز مشاهده آمار نداری.')
             await self.safe_edit(chat_id,message_id,self.stats_text(await self.db.stats()),inline([[('↩️ برگشت','admin:page:0'),('✖️ بستن','close')]])); return
         
         if data.startswith('adm:uhist:') or data.startswith('adm:ugroups:') or data.startswith('adm:uwarn:') or data.startswith('adm:uwarnlv:') or data.startswith('adm:uwarngo:'):
@@ -4765,27 +4785,27 @@ class MegaBot:
             return
 
         if data in ('adm:search:user','adm:search:group'):
-            if not await self.has_perm(uid,'search'): return await self.safe_send(chat_id,'⛔ مجوز جست‌وجو نداری.')
+            if not await self.has_perm(uid,'search'): return await self._cb_alert(getattr(self, '_current_callback_id', None), '⛔ مجوز جست‌وجو نداری.')
             target_type = data.rsplit(':',1)[1]
             self.states[uid]={'step':'search','target_type':target_type,'chat_id':chat_id,'message_id':message_id}
             await self.safe_edit(chat_id,message_id,f"*جست‌وجوی {'کاربر' if target_type=='user' else 'گروه'}*\nشناسه عددی یا `@username` رو در همین گفتگو بفرست.",inline([[('↩️ برگشت','admin:page:0'),('✖️ بستن','close')]])); return
         if data == 'adm:case':
-            if not await self.has_perm(uid,'case_lookup'): return await self.safe_send(chat_id,'⛔ مجوز بررسی پرونده نداری.')
+            if not await self.has_perm(uid,'case_lookup'): return await self._cb_alert(getattr(self, '_current_callback_id', None), '⛔ مجوز بررسی پرونده نداری.')
             self.states[uid]={'step':'case_lookup','chat_id':chat_id,'message_id':message_id}
             await self.safe_edit(chat_id,message_id,'کد پیگیری رو بفرست؛ مثال: `#5453`',inline([[('↩️ برگشت','admin:page:0'),('✖️ بستن','close')]])); return
         if data == 'adm:logs':
-            if not owner and not await self.has_perm(uid,'settings'): return await self.safe_send(chat_id,'⛔ مشاهده گزارش فعالیت‌ها فقط برای مالک یا ادمین مجاز است.')
+            if not owner and not await self.has_perm(uid,'settings'): return await self._cb_alert(getattr(self, '_current_callback_id', None), '⛔ مشاهده گزارش فعالیت‌ها فقط برای مالک یا ادمین مجاز است.')
             async with self.db._pool().acquire() as c:
                 rows = await c.fetch('SELECT actor_id,action,target_type,target_id,created_at FROM audit_logs ORDER BY id DESC LIMIT 10')
             body = '*آخرین فعالیت‌ها*\n\n' + ('\n'.join(f"• `{r['actor_id']}` — {r['action']} — {r['target_type'] or '-'} `{r['target_id'] or '-'}`" for r in rows) if rows else 'هنوز فعالیتی ثبت نشده.')
             await self.safe_edit(chat_id,message_id,body,inline([[('↩️ برگشت','admin:page:0'),('✖️ بستن','close')]])); return
         if data == 'own:about':
-            if not await self.has_perm(uid,'edit_about'): return await self.safe_send(chat_id,'⛔ مجوز ویرایش درباره ما نداری.')
+            if not await self.has_perm(uid,'edit_about'): return await self._cb_alert(getattr(self, '_current_callback_id', None), '⛔ مجوز ویرایش درباره ما نداری.')
             self.states[uid]={'step':'edit_about','chat_id':chat_id,'message_id':message_id}
             current = await self.db.get_setting('about','')
             await self.safe_edit(chat_id,message_id,f"*ویرایش درباره ما*\nمتن فعلی:\n{current}\n\nحالا متن جدید رو در همین گفتگو بفرست.",inline([[('↩️ برگشت','admin:page:0'),('✖️ بستن','close')]])); return
         if data == 'own:team':
-            if not await self.has_perm(uid,'edit_team'): return await self.safe_send(chat_id,'⛔ مجوز مدیریت تیم نداری.')
+            if not await self.has_perm(uid,'edit_team'): return await self._cb_alert(getattr(self, '_current_callback_id', None), '⛔ مجوز مدیریت تیم نداری.')
             team = await self.db.get_team()
             rows = [[('➕ افزودن عضو','team:add')]]
             rows += [[(f"👤 {m['name'][:25]}",f"team:member:{m['id']}")] for m in team[:3]]
@@ -4816,7 +4836,7 @@ class MegaBot:
             ok=await self.db.delete_team_member(member_id,uid)
             await self.safe_edit(chat_id,message_id,'عضو حذف شد.' if ok else 'این عضو پیدا نشد.',inline([[('↩️ برگشت','own:team'),('✖️ بستن','close')]])); return
         if data == 'own:admins':
-            if not owner: return await self.safe_send(chat_id,'⛔ فقط مالک می‌تواند ادمین‌ها را مدیریت کند.')
+            if not owner: return await self._cb_alert(getattr(self, '_current_callback_id', None), '⛔ فقط مالک می‌تواند ادمین‌ها را مدیریت کند.')
             admins=await self.db.list_admins(10,0)
             rows=[[('➕ افزودن ادمین','own:admin_add')]]
             for a in admins[:2]: rows.append([(f"⚙️ {a['display_name'] or a['user_id']}",f"own:admin:{a['user_id']}")])
@@ -5207,7 +5227,7 @@ class MegaBot:
 
     async def handle_target_select(self, uid: int, chat_id: int, message_id: int, data: str) -> None:
         if uid != OWNER_ID and not await self.db.is_admin(uid):
-            return await self.safe_send(chat_id, '⛔ دسترسی مدیریت نداری.')
+            return await self._cb_alert(getattr(self, '_current_callback_id', None), '⛔ دسترسی مدیریت نداری.')
         parts = data.split(':')
         if len(parts) < 4 or parts[0] != 'adm' or parts[1] != 'target':
             return
@@ -5223,7 +5243,7 @@ class MegaBot:
             await self.safe_edit(chat_id, message_id, '❌ شناسه نامعتبر است.', None)
             return
         if not await self.has_perm(uid, 'search'):
-            return await self.safe_send(chat_id, '⛔ مجوز جست‌وجو نداری.')
+            return await self._cb_alert(getattr(self, '_current_callback_id', None), '⛔ مجوز جست‌وجو نداری.')
         rows = await self.db.search_target(str(target_id), target_type)
         target = rows[0] if rows else {'id': target_id, 'name': str(target_id), 'username': None}
         if target_type == 'group':
@@ -7844,7 +7864,7 @@ class MegaBot:
             except ValueError:
                 page = 0
             if is_group and not (await self._is_chat_admin(chat_id, uid) or uid == OWNER_ID):
-                await self.safe_send(chat_id, '⛔ این قابلیت فقط برای مدیران گروه فعاله!', parse_mode=None)
+                await self._cb_alert(getattr(self, "_current_callback_id", None), '⛔ این قابلیت فقط برای مدیران گروه فعاله!')
                 return
             scope_type, scope_id = ('group', chat_id) if is_group else ('private', uid)
             await self._show_learned_list(chat_id, scope_type, scope_id, page, requester_uid=uid)
@@ -7854,13 +7874,13 @@ class MegaBot:
             try:
                 asked_scope = int(data.rsplit(':', 1)[1])
             except ValueError:
-                await self.safe_send(chat_id, '❌ داده نامعتبر.', parse_mode=None)
+                await self._cb_alert(getattr(self, "_current_callback_id", None), '❌ داده نامعتبر.')
                 return
             if not is_group or asked_scope != chat_id:
-                await self.safe_send(chat_id, '⛔ فقط حافظه همین گروه.', parse_mode=None)
+                await self._cb_alert(getattr(self, "_current_callback_id", None), '⛔ فقط حافظه همین گروه.')
                 return
             if not (await self._is_chat_admin(chat_id, uid) or uid == OWNER_ID):
-                await self.safe_send(chat_id, '⛔ این قابلیت فقط برای مدیران گروه فعاله!', parse_mode=None)
+                await self._cb_alert(getattr(self, "_current_callback_id", None), '⛔ این قابلیت فقط برای مدیران گروه فعاله!')
                 return
             await self.safe_edit(
                 chat_id,
@@ -7878,14 +7898,14 @@ class MegaBot:
             try:
                 target_scope = int(data.rsplit(':', 1)[1])
             except ValueError:
-                await self.safe_send(chat_id, '❌ داده نامعتبر.', parse_mode=None)
+                await self._cb_alert(getattr(self, "_current_callback_id", None), '❌ داده نامعتبر.')
                 return
             if not is_group or target_scope != chat_id:
-                await self.safe_send(chat_id, '⛔ فقط حافظه همین گروه.', parse_mode=None)
+                await self._cb_alert(getattr(self, "_current_callback_id", None), '⛔ فقط حافظه همین گروه.')
                 return
             # Re-check admin on confirm (security)
             if not (await self._is_chat_admin(chat_id, uid) or uid == OWNER_ID):
-                await self.safe_send(chat_id, '⛔ این قابلیت فقط برای مدیران گروه فعاله!', parse_mode=None)
+                await self._cb_alert(getattr(self, "_current_callback_id", None), '⛔ این قابلیت فقط برای مدیران گروه فعاله!')
                 return
             try:
                 deleted = await self.db.clear_learned('group', chat_id)
@@ -7907,13 +7927,13 @@ class MegaBot:
             _, _, scope_type, scope_id_s, trigger_norm = parts
             # Only allow deleting own private scope or group scope of this chat
             if scope_type == 'private' and int(scope_id_s) != uid:
-                await self.safe_send(chat_id, '⛔ فقط حافظه خودت.', parse_mode=None)
+                await self._cb_alert(getattr(self, "_current_callback_id", None), '⛔ فقط حافظه خودت.')
                 return
             if scope_type == 'group' and int(scope_id_s) != chat_id:
-                await self.safe_send(chat_id, '⛔ فقط حافظه همین گروه.', parse_mode=None)
+                await self._cb_alert(getattr(self, "_current_callback_id", None), '⛔ فقط حافظه همین گروه.')
                 return
             if scope_type == 'group' and not (await self._is_chat_admin(chat_id, uid) or uid == OWNER_ID):
-                await self.safe_send(chat_id, '⛔ این قابلیت فقط برای مدیران گروه فعاله!', parse_mode=None)
+                await self._cb_alert(getattr(self, "_current_callback_id", None), '⛔ این قابلیت فقط برای مدیران گروه فعاله!')
                 return
             ok = await self.db.delete_learned(scope_type, int(scope_id_s), trigger_norm)
             await self.safe_send(chat_id, '✅ انجام شد! 🗑 حذف شد.' if ok else '🔎 پیام موردنظر پیدا نشد یا امکان حذفش وجود نداره.', parse_mode=None)
@@ -7923,7 +7943,7 @@ class MegaBot:
             await self.safe_send(chat_id, 'این بخش فقط در گروه است.', parse_mode=None)
             return
         if not (await self._is_chat_admin(chat_id, uid) or uid == OWNER_ID):
-            await self.safe_send(chat_id, '⛔ فقط ادمین گروه.', parse_mode=None)
+            await self._cb_alert(getattr(self, "_current_callback_id", None), '⛔ فقط ادمین گروه.')
             return
         if data == 'grp:panel':
             await self._show_group_panel(chat_id, uid)
@@ -8026,7 +8046,7 @@ class MegaBot:
             except ValueError:
                 return
             if n < 1 or n > 50:
-                await self.safe_send(chat_id, '❌ عدد اخطار باید بین ۱ تا ۵۰ باشد.', parse_mode=None)
+                await self._cb_alert(getattr(self, "_current_callback_id", None), '❌ عدد اخطار باید بین ۱ تا ۵۰ باشد.')
                 return
             await self.db.update_moderation(chat_id, warn_limit=n)
             await self._show_warn_config(chat_id, message_id)
@@ -8037,7 +8057,7 @@ class MegaBot:
             except ValueError:
                 return
             if h < 0 or h > 8760:
-                await self.safe_send(chat_id, '❌ مدت اعتبار نامعتبر است.', parse_mode=None)
+                await self._cb_alert(getattr(self, "_current_callback_id", None), '❌ مدت اعتبار نامعتبر است.')
                 return
             await self.db.update_moderation(chat_id, warn_ttl_hours=h)
             await self._show_warn_config(chat_id, message_id)
@@ -8379,7 +8399,7 @@ class MegaBot:
 
     async def _handle_schedule_callback(self, uid: int, chat_id: int, message_id: int, data: str) -> None:
         if not (await self._is_chat_admin(chat_id, uid) or uid == OWNER_ID):
-            await self.safe_send(chat_id, '⛔ این بخش مخصوص مدیران گروه است.', parse_mode=None)
+            await self._cb_alert(getattr(self, "_current_callback_id", None), '⛔ این بخش مخصوص مدیران گروه است.')
             return
         if data in ('lock:sch', 'sch:panel'):
             await self._show_schedule_panel(chat_id, message_id)
@@ -9486,7 +9506,7 @@ class MegaBot:
         if step == 'set_donation_total':
             if uid != OWNER_ID:
                 self.states.pop(uid, None)
-                await self.safe_send(chat_id, '⛔ فقط مالک اصلی.', parse_mode=None)
+                await self._cb_alert(getattr(self, '_current_callback_id', None), '⛔ فقط مالک اصلی.')
                 return True
             if text.strip() in ('لغو', 'cancel', 'انصراف'):
                 self.states.pop(uid, None)
